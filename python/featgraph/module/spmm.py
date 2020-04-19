@@ -3,7 +3,8 @@ import tvm
 from topi.util import get_const_tuple
 
 from ..util import util_convert_csr_to_dds
-from ..op import vanilla_spmm, schedule_vanilla_spmm_x86
+from ..op import vanilla_spmm, schedule_vanilla_spmm_x86, \
+    mlp_conv_spmm_ir_x86
 
 
 class SpMMbase():
@@ -175,3 +176,14 @@ class VanillaSpMMcuda(SpMMbase):
 
     def _register(self):
         pass
+
+
+class MLPConvSpMMx86(SpMMbase):
+    def __init__(self, adj_scipy, num_col_partitions=1):
+        super(MLPConvSpMMx86, self).__init__(adj_scipy, num_col_partitions)
+
+    def _register(self):
+        self._target = 'llvm'
+        self._ctx = tvm.cpu(0)
+        self._compute_func = mlp_conv_spmm_ir_x86
+        self._schedule_func = lambda Out, **kwargs: tvm.create_schedule([Out.op])
