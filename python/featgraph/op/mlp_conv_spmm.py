@@ -88,6 +88,7 @@ def mlp_conv_spmm_ir_x86(SrcFeat,
         Intermediate= ib.allocate(SrcFeat.dtype, (num_dst_vertices, feat_2_len_per_partition), \
             name='Intermediate', scope='global')
 
+        SrcDstbuffer = ib.allocate(SrcFeat.dtype, (feat_1_len,), name='SrcDstbuffer', scope='local')
         MLPbuffer = ib.allocate(SrcFeat.dtype, (feat_2_len_per_partition,), name='MLPbuffer', scope='local')
 
         # initialize ReshapedOut
@@ -111,10 +112,12 @@ def mlp_conv_spmm_ir_x86(SrcFeat,
                         # reset MLPbuffer
                         with ib.for_range(0, feat_2_len_per_partition, name='feat_2_inner_idx') as feat_2_inner_idx:
                             MLPbuffer[feat_2_inner_idx] = 0.
+                        with ib.for_range(0, feat_1_len, name='feat_1_idx') as feat_1_idx:
+                            SrcDstbuffer[feat_1_idx] = SrcFeat_ptr[(Adj_s1_idx_ptr[row_start + elem_idx] + src_vertex_partition_idx*num_src_vertices_per_partition)*feat_1_len + feat_1_idx] \
+                                                       + DstFeat_ptr[row_idx*feat_1_len + feat_1_idx]
                         with ib.for_range(0, feat_2_len_per_partition, name='feat_2_inner_idx') as feat_2_inner_idx:
                             with ib.for_range(0, feat_1_len, name='feat_1_idx') as feat_1_idx:
-                                MLPbuffer[feat_2_inner_idx] += (SrcFeat_ptr[(Adj_s1_idx_ptr[row_start + elem_idx] + src_vertex_partition_idx*num_src_vertices_per_partition)*feat_1_len + feat_1_idx] \
-                                                                + DstFeat_ptr[row_idx*feat_1_len + feat_1_idx]) * Weight_ptr[(feat_2_inner_idx + feat_2_outer_idx*feat_2_len_per_partition)*feat_1_len + feat_1_idx]
+                                MLPbuffer[feat_2_inner_idx] += SrcDstbuffer[feat_1_idx] * Weight_ptr[(feat_2_inner_idx + feat_2_outer_idx*feat_2_len_per_partition)*feat_1_len + feat_1_idx]
                             # ReLU
                             MLPbuffer[feat_2_inner_idx] = tvm.max(MLPbuffer[feat_2_inner_idx], 0.)
                         # max aggregation
