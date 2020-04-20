@@ -66,7 +66,8 @@ def test_mlp_conv_spmm(adj_scipy_csr, target):
     Weight = tvm.placeholder((feat_2_len, feat_1_len))
     input_placeholders = [SrcFeat, DstFeat, Weight]
     if target == 'x86':
-        compute_args = {}
+        num_feat_2_partitions = 4
+        compute_args = {'num_feat_2_partitions': num_feat_2_partitions}
         schedule_args = {}
     elif target == 'cuda':
         pass

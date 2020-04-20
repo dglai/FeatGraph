@@ -43,7 +43,7 @@ def mlp_conv_spmm_ir_x86(SrcFeat,
         Doing feature dimension tiling (not implemented yet)
 
     num_feat_2_partitions : int
-        Doing feature dimension tiling (not implemented yet)
+        Doing feature dimension tiling
 
     Returns
     -------
@@ -61,7 +61,7 @@ def mlp_conv_spmm_ir_x86(SrcFeat,
     assert feat_1_len == DstFeat.shape[1].value
     assert feat_1_len == Weight.shape[1].value
 
-    feat_1_len_per_partition = feat_1_len // num_feat_1_partitions  # we assume feat_1_len % num_feat_1_partitions = 0
+    # feat_1_len_per_partition = feat_1_len // num_feat_1_partitions  # we assume feat_1_len % num_feat_1_partitions = 0
     feat_2_len_per_partition = feat_2_len // num_feat_2_partitions  # we assume feat_2_len % num_feat_2_partitions = 0
     num_src_vertices_per_partition = (num_src_vertices + num_src_vertex_partitions - 1) // num_src_vertex_partitions
 
@@ -82,44 +82,57 @@ def mlp_conv_spmm_ir_x86(SrcFeat,
         Adj_vals_ptr = ib.buffer_ptr(Adj_vals)
         Out_ptr = ib.buffer_ptr(Out)
 
-        Intermediate= ib.allocate(SrcFeat.dtype, (num_dst_vertices, feat_2_len), \
+        ReshapedOut = ib.allocate(Out.dtype, (num_feat_2_partitions, num_dst_vertices, feat_2_len_per_partition), \
+            name='ReshapedOut', scope='global')
+
+        Intermediate= ib.allocate(SrcFeat.dtype, (num_dst_vertices, feat_2_len_per_partition), \
             name='Intermediate', scope='global')
 
-        MLPbuffer = ib.allocate(SrcFeat.dtype, (feat_2_len,), name='MLPbuffer', scope='local')
+        MLPbuffer = ib.allocate(SrcFeat.dtype, (feat_2_len_per_partition,), name='MLPbuffer', scope='local')
 
-        # initialize Out_ptr
-        with ib.for_range(0, num_dst_vertices, name='row_idx') as row_idx:
-            with ib.for_range(0, feat_2_len, name='feat_2_idx') as feat_2_idx:
-                Out_ptr[row_idx*feat_2_len + feat_2_idx] = 0.
+        # initialize ReshapedOut
+        with ib.for_range(0, num_feat_2_partitions, name='feat_2_outer_idx') as feat_2_outer_idx:
+            with ib.for_range(0, num_dst_vertices, name='row_idx') as row_idx:
+                with ib.for_range(0, feat_2_len_per_partition, name='feat_2_inner_idx') as feat_2_inner_idx:
+                    ReshapedOut[feat_2_outer_idx*num_dst_vertices*feat_2_len_per_partition + row_idx*feat_2_len_per_partition + feat_2_inner_idx] = 0.
 
-        with ib.for_range(0, num_src_vertex_partitions, name='src_vertex_partition_idx') as src_vertex_partition_idx:
-            # reset Intermediate
+        with ib.for_range(0, num_feat_2_partitions, name='feat_2_outer_idx') as feat_2_outer_idx:
+            with ib.for_range(0, num_src_vertex_partitions, name='src_vertex_partition_idx') as src_vertex_partition_idx:
+                # reset Intermediate
+                with ib.for_range(0, num_dst_vertices, name='row_idx') as row_idx:
+                    with ib.for_range(0, feat_2_len_per_partition, name='feat_2_inner_idx') as feat_2_inner_idx:
+                        Intermediate[row_idx*feat_2_len_per_partition + feat_2_inner_idx] = 0.
+                # handle each 1D partition
+                with ib.for_range(0, num_dst_vertices, name='row_idx') as row_idx:
+                    row_start = Adj_s1_pos_ptr[src_vertex_partition_idx*d2_size + row_idx]
+                    row_end = Adj_s1_pos_ptr[src_vertex_partition_idx*d2_size + row_idx + 1]
+                    row_num_elems = row_end - row_start
+                    with ib.for_range(0, row_num_elems, name='elem_idx') as elem_idx:
+                        # reset MLPbuffer
+                        with ib.for_range(0, feat_2_len_per_partition, name='feat_2_inner_idx') as feat_2_inner_idx:
+                            MLPbuffer[feat_2_inner_idx] = 0.
+                        with ib.for_range(0, feat_2_len_per_partition, name='feat_2_inner_idx') as feat_2_inner_idx:
+                            with ib.for_range(0, feat_1_len, name='feat_1_idx') as feat_1_idx:
+                                MLPbuffer[feat_2_inner_idx] += (SrcFeat_ptr[(Adj_s1_idx_ptr[row_start + elem_idx] + src_vertex_partition_idx*num_src_vertices_per_partition)*feat_1_len + feat_1_idx] \
+                                                                + DstFeat_ptr[row_idx*feat_1_len + feat_1_idx]) * Weight_ptr[(feat_2_inner_idx + feat_2_outer_idx*feat_2_len_per_partition)*feat_1_len + feat_1_idx]
+                            # ReLU
+                            MLPbuffer[feat_2_inner_idx] = tvm.max(MLPbuffer[feat_2_inner_idx], 0.)
+                        # max aggregation
+                        with ib.for_range(0, feat_2_len_per_partition, name='feat_2_inner_idx') as feat_2_inner_idx:
+                            Intermediate[row_idx*feat_2_len_per_partition + feat_2_inner_idx] = tvm.max(Intermediate[row_idx*feat_2_len_per_partition + feat_2_inner_idx], MLPbuffer[feat_2_inner_idx])
+                # merge partitions
+                with ib.for_range(0, num_dst_vertices, name='row_idx') as row_idx:
+                    with ib.for_range(0, feat_2_len_per_partition, name='feat_2_inner_idx') as feat_2_inner_idx:
+                        ReshapedOut[feat_2_outer_idx*num_dst_vertices*feat_2_len_per_partition + row_idx*feat_2_len_per_partition + feat_2_inner_idx] = \
+                            tvm.max(ReshapedOut[feat_2_outer_idx*num_dst_vertices*feat_2_len_per_partition + row_idx*feat_2_len_per_partition + feat_2_inner_idx], \
+                                Intermediate[row_idx*feat_2_len_per_partition + feat_2_inner_idx])
+
+        # copy from ReshapedOut to Out_ptr
+        with ib.for_range(0, num_feat_2_partitions, name='feat_2_outer_idx') as feat_2_outer_idx:
             with ib.for_range(0, num_dst_vertices, name='row_idx') as row_idx:
-                with ib.for_range(0, feat_2_len, name='feat_2_idx') as feat_2_idx:
-                    Intermediate[row_idx*feat_2_len + feat_2_idx] = 0.
-            # handle each 1D partition
-            with ib.for_range(0, num_dst_vertices, name='row_idx') as row_idx:
-                row_start = Adj_s1_pos_ptr[src_vertex_partition_idx*d2_size + row_idx]
-                row_end = Adj_s1_pos_ptr[src_vertex_partition_idx*d2_size + row_idx + 1]
-                row_num_elems = row_end - row_start
-                with ib.for_range(0, row_num_elems, name='elem_idx') as elem_idx:
-                    # reset MLPbuffer
-                    with ib.for_range(0, feat_2_len, name='feat_2_idx') as feat_2_idx:
-                        MLPbuffer[feat_2_idx] = 0.
-                    with ib.for_range(0, feat_2_len, name='feat_2_idx') as feat_2_idx:
-                        with ib.for_range(0, feat_1_len, name='feat_1_idx') as feat_1_idx:
-                            MLPbuffer[feat_2_idx] += (SrcFeat_ptr[(Adj_s1_idx_ptr[row_start + elem_idx] + src_vertex_partition_idx*num_src_vertices_per_partition)*feat_1_len + feat_1_idx] \
-                                                                   + DstFeat_ptr[row_idx*feat_1_len + feat_1_idx]) * Weight_ptr[feat_2_idx*feat_1_len + feat_1_idx]
-                        # ReLU
-                        MLPbuffer[feat_2_idx] = tvm.max(MLPbuffer[feat_2_idx], 0.)
-                    # max aggregation
-                    with ib.for_range(0, feat_2_len, name='feat_2_idx') as feat_2_idx:
-                        Intermediate[row_idx*feat_2_len + feat_2_idx] = tvm.max(Intermediate[row_idx*feat_2_len + feat_2_idx], MLPbuffer[feat_2_idx])
-            # merge partitions
-            with ib.for_range(0, num_dst_vertices, name='row_idx') as row_idx:
-                with ib.for_range(0, feat_2_len, name='feat_2_idx') as feat_2_idx:
-                    Out_ptr[row_idx*feat_2_len + feat_2_idx] = tvm.max(Out_ptr[row_idx*feat_2_len + feat_2_idx], \
-                        Intermediate[row_idx*feat_2_len + feat_2_idx])
+                with ib.for_range(0, feat_2_len_per_partition, name='feat_2_inner_idx') as feat_2_inner_idx:
+                    Out_ptr[row_idx*feat_2_len + (feat_2_outer_idx*feat_2_len_per_partition + feat_2_inner_idx)] = \
+                        ReshapedOut[feat_2_outer_idx*num_dst_vertices*feat_2_len_per_partition + row_idx*feat_2_len_per_partition + feat_2_inner_idx]
 
         return ib.get()
 
