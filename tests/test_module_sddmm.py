@@ -3,6 +3,7 @@ import scipy.sparse
 import numpy as np
 import time
 import tvm
+from tvm import te
 from topi.util import get_const_tuple
 
 from featgraph.module import VanillaSDDMMx86, VanillaSDDMMcuda, MultiHeadSDDMMx86, MultiHeadSDDMMcuda
@@ -15,8 +16,8 @@ def test_vanilla_sddmm(adj_scipy_coo, target):
     # doing 2D graph partitioning during initialization
     # note that 2D partitioning is mainly useful for CPU since it optimizes cache
     if target == 'x86':
-        adj_row_num_partition = 4
-        adj_col_num_partition = 4
+        adj_row_num_partition = 910
+        adj_col_num_partition = 910
         module = VanillaSDDMMx86
     elif target == 'cuda':
         adj_row_num_partition = 1
@@ -28,11 +29,11 @@ def test_vanilla_sddmm(adj_scipy_coo, target):
 
     # tvm func is built for a specific feat_len and num_feat_partitions
     feat_len = 128
-    SrcFeat = tvm.placeholder((num_rows, feat_len))
-    DstFeat = tvm.placeholder((num_cols, feat_len))
+    SrcFeat = te.placeholder((num_rows, feat_len))
+    DstFeat = te.placeholder((num_cols, feat_len))
     input_placeholders = [SrcFeat, DstFeat]
     if target == 'x86':
-        num_feat_partitions = 4
+        num_feat_partitions = 32
         compute_args = {'num_feat_partitions': num_feat_partitions}
         schedule_args = {'num_feat_partitions': num_feat_partitions}
     elif target == 'cuda':
@@ -44,6 +45,8 @@ def test_vanilla_sddmm(adj_scipy_coo, target):
     else:
         raise RuntimeError("invalid target")
     vanilla_sddmm_module.build(input_placeholders, compute_args, schedule_args)
+    # print(vanilla_sddmm_module.lower_to_ir(input_placeholders, compute_args, schedule_args))
+    print(vanilla_sddmm_module.cuda_source())
 
     # run
     src_feat_np = np.random.random(get_const_tuple(SrcFeat.shape)).astype('float32')
@@ -51,16 +54,24 @@ def test_vanilla_sddmm(adj_scipy_coo, target):
     src_feat_tvm = tvm.nd.array(src_feat_np, vanilla_sddmm_module.ctx)
     dst_feat_tvm = tvm.nd.array(dst_feat_np, vanilla_sddmm_module.ctx)
     feat_tvm_ndarrays = [src_feat_tvm, dst_feat_tvm]
-    out_tvm = vanilla_sddmm_module.run(feat_tvm_ndarrays).asnumpy()
+    # out_tvm = vanilla_sddmm_module.run(feat_tvm_ndarrays).asnumpy()
+    print('warming up')
+    for i in range(10):
+        vanilla_sddmm_module.run(feat_tvm_ndarrays).asnumpy()
+    print("finished warmup")
+    start = time.time()
+    for i in range(100):
+        vanilla_sddmm_module.run(feat_tvm_ndarrays).asnumpy()
+    print('Elapsed time: {} seconds'.format((time.time() - start) / 100))
     # be careful here
-    if target == 'x86':
-        out_tvm = out_tvm[vanilla_sddmm_module.edge_mapping]
+    # if target == 'x86':
+    #     out_tvm = out_tvm[vanilla_sddmm_module.edge_mapping]
 
     # check correctness against scipy
-    lhs = src_feat_np[adj_scipy_coo.row]
-    rhs = dst_feat_np[adj_scipy_coo.col]
-    out_scipy = (lhs * rhs).sum(axis=-1)
-    np.testing.assert_allclose(out_scipy, out_tvm, rtol=1e-4, atol=1e-4)
+    # lhs = src_feat_np[adj_scipy_coo.row]
+    # rhs = dst_feat_np[adj_scipy_coo.col]
+    # out_scipy = (lhs * rhs).sum(axis=-1)
+    # np.testing.assert_allclose(out_scipy, out_tvm, rtol=1e-4, atol=1e-4)
 
 
 def test_multi_head_dot_product_attention_sddmm(adj_scipy_coo, target):
@@ -84,8 +95,8 @@ def test_multi_head_dot_product_attention_sddmm(adj_scipy_coo, target):
     # tvm func is built for a specific num_heads, num_head_partitions, feat_len, num_feat_partitions
     num_heads = 16
     feat_len = 64
-    SrcFeat = tvm.placeholder((num_rows, num_heads, feat_len))
-    DstFeat = tvm.placeholder((num_cols, num_heads, feat_len))
+    SrcFeat = te.placeholder((num_rows, num_heads, feat_len))
+    DstFeat = te.placeholder((num_cols, num_heads, feat_len))
     input_placeholders = [SrcFeat, DstFeat]
     if target == 'x86':
         num_head_partitions = 2
@@ -123,6 +134,11 @@ def test_multi_head_dot_product_attention_sddmm(adj_scipy_coo, target):
 
 
 if __name__ == '__main__':
-    adj_scipy_coo = scipy.sparse.random(127, 255, density=0.1, format='coo').astype('int32')
-    test_vanilla_sddmm(adj_scipy_coo, 'x86')
-    test_multi_head_dot_product_attention_sddmm(adj_scipy_coo, 'x86')
+    # adj_scipy_coo = scipy.sparse.random(127, 255, density=0.1, format='coo').astype('int32')
+    import dgl
+    from dgl.data import RedditDataset
+    data = RedditDataset()
+    # data._load()
+    adj_scipy_coo = data.graph.adjacency_matrix_scipy(fmt='coo')
+    test_vanilla_sddmm(adj_scipy_coo, 'cuda')
+    # test_multi_head_dot_product_attention_sddmm(adj_scipy_coo, 'x86')

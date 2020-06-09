@@ -1,5 +1,6 @@
 import tvm
 from topi.util import get_const_tuple
+from tvm import te
 
 
 def multi_head_dot_product_attention_sddmm(SrcFeat,
@@ -42,25 +43,25 @@ def multi_head_dot_product_attention_sddmm(SrcFeat,
     assert get_const_tuple(Adj_col_indices.shape)[0] == num_edges, "dimension mismatch"
     oshape = (num_edges, num_heads)
 
-    k = tvm.reduce_axis((0, feat_len))
+    k = te.reduce_axis((0, feat_len))
 
     if num_feat_partitions == 1 and num_head_partitions == 1:
         def edgefunc(eid, hid):  # eid: edge id, hid: head id
-            return tvm.sum(SrcFeat[Adj_row_indices[eid], hid, k] * DstFeat[Adj_col_indices[eid], hid, k], axis=k)
+            return te.sum(SrcFeat[Adj_row_indices[eid], hid, k] * DstFeat[Adj_col_indices[eid], hid, k], axis=k)
     else:
         num_heads_per_partition = num_heads // num_head_partitions  # we assume num_heads % num_head_partitions = 0
         feat_len_per_partition = feat_len // num_feat_partitions  # we assume feat_len % num_feat_partitions = 0
         num_rows = get_const_tuple(SrcFeat.shape)[0]
         num_cols = get_const_tuple(DstFeat.shape)[0]
-        ReshapedSrcFeat = tvm.compute((num_head_partitions, num_feat_partitions, num_rows, num_heads_per_partition, feat_len_per_partition), \
+        ReshapedSrcFeat = te.compute((num_head_partitions, num_feat_partitions, num_rows, num_heads_per_partition, feat_len_per_partition), \
                                        lambda ho, fo, nn, hi, fi: SrcFeat[nn, ho*num_heads_per_partition + hi, fo*feat_len_per_partition + fi], \
                                        name='ReshapedSrcFeat')
-        ReshapedDstFeat = tvm.compute((num_head_partitions, num_feat_partitions, num_cols, num_heads_per_partition, feat_len_per_partition), \
+        ReshapedDstFeat = te.compute((num_head_partitions, num_feat_partitions, num_cols, num_heads_per_partition, feat_len_per_partition), \
                                        lambda ho, fo, nn, hi, fi: DstFeat[nn, ho*num_heads_per_partition + hi, fo*feat_len_per_partition + fi], \
                                        name='ReshapedDstFeat')
         # TODO: also transform the layout of Out to improve write locality?
         def edgefunc(eid, hid):  # eid: edge id, hid: head id
-            return tvm.sum(ReshapedSrcFeat[hid // num_heads_per_partition, \
+            return te.sum(ReshapedSrcFeat[hid // num_heads_per_partition, \
                                            k // feat_len_per_partition, \
                                            Adj_row_indices[eid], \
                                            hid % num_heads_per_partition, \
@@ -71,12 +72,12 @@ def multi_head_dot_product_attention_sddmm(SrcFeat,
                                              hid % num_heads_per_partition, \
                                              k % feat_len_per_partition], axis=k)
 
-    Out = tvm.compute(oshape, edgefunc, name='multi_head_dot_product_attention_sddmm')
+    Out = te.compute(oshape, edgefunc, name='multi_head_dot_product_attention_sddmm')
     return Out
 
 
 def schedule_multi_head_dot_product_attention_sddmm_x86(Out, num_head_partitions=1, num_feat_partitions=1):
-    s = tvm.create_schedule([Out.op])
+    s = te.create_schedule([Out.op])
     if num_feat_partitions != 1 or num_head_partitions != 1:
         edge_iter_axis = Out.op.axis[0]
         head_iter_axis = Out.op.axis[1]
