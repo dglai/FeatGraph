@@ -32,10 +32,18 @@ class SDDMMbase():
             adj_scipy_coo = adj_scipy
         self._num_rows = adj_scipy_coo.shape[0]
         self._num_cols = adj_scipy_coo.shape[1]
-        # 2D graph partitioning
+        assert num_row_partitions >= 1, "num_row_partitions should be larger than or equal to 1"
+        assert num_col_partitions >= 1, "num_col_partitions should be larger than or equal to 1"
         self._num_row_partitions = num_row_partitions
         self._num_col_partitions = num_row_partitions
-        if self._num_row_partitions != 1 or self._num_col_partitions != 1:
+        # To be updated in self.register
+        self._target = None
+        self._ctx = None
+        self._compute_func = None
+        self._schedule_func = None
+        self._register()
+        # 2D graph partitioning
+        if self._num_row_partitions > 1 or self._num_col_partitions > 1:
             edge_id_list, adj_row_indices, adj_col_indices = self._preprocess_adj(adj_scipy_coo, \
                 self._num_row_partitions, self._num_col_partitions)
             # This is smart; credit to Zihao
@@ -45,16 +53,15 @@ class SDDMMbase():
             adj_col_indices = adj_scipy_coo.col
         self._adj_row_indices = adj_row_indices
         self._adj_col_indices = adj_col_indices
-        # To be updated in register
-        self._target = None
-        self._ctx = None
-        self._compute_func = None
-        self._schedule_func = None
-        self._register()
-        # To be updated in build
-        self._adj_row_indices_tvm = None
-        self._adj_col_indices_tvm = None
+        self._adj_row_indices_placeholder = tvm.placeholder(shape=self._adj_row_indices.shape, \
+            dtype=str(self._adj_row_indices.dtype), name='adj_row_indices_placeholder')
+        self._adj_col_indices_placeholder = tvm.placeholder(shape=self._adj_col_indices.shape, \
+            dtype=str(self._adj_col_indices.dtype), name='adj_col_indices_placeholder')
+        self._adj_row_indices_tvm = tvm.nd.array(self._adj_row_indices, ctx=self._ctx)
+        self._adj_col_indices_tvm = tvm.nd.array(self._adj_col_indices, ctx=self._ctx)
+        # To be updated in self.build
         self._func = None
+        # To be updated in self.run
         self.out_tvm = None
 
     def _preprocess_adj(self, adj_scipy_coo, num_row_partitions=1, num_col_partitions=1):
@@ -64,7 +71,7 @@ class SDDMMbase():
         raise NotImplementedError("Please register target, ctx, compute_func, and schedule_func.")
 
     def build(self, input_placeholders, compute_args, schedule_args):
-        """Build tvm func; update self._func inplace.
+        """Build tvm func, update self._func inplace.
 
         Parameters
         ----------
@@ -130,7 +137,7 @@ class SDDMMbase():
 
         Parameters
         ----------
-        feat_tvm_ndarrays : list of tvm.ndarray
+        input_tvm_ndarrays : list of tvm.ndarray
             The required input tvm ndarrays other than adj (which has been created during self.build)
 
         Returns
@@ -138,13 +145,13 @@ class SDDMMbase():
         self.out_tvm: tvm.ndarray
             The output tvm ndarray
         """
-        self._func(*feat_tvm_ndarrays, self._adj_row_indices_tvm, self._adj_col_indices_tvm, self.out_tvm)
+        self._func(*input_tvm_ndarrays, self._adj_row_indices_tvm, self._adj_col_indices_tvm, self.out_tvm)
         return self.out_tvm
 
     @property
     def edge_mapping(self):
         assert self._target != 'cuda', "no graph partitioning on cuda, no edge_mapping"
-        assert self._num_row_partitions != 1 or self._num_col_partitions != 1, \
+        assert self._num_row_partitions > 1 or self._num_col_partitions > 1, \
             "no graph partitioning, no edge_mapping"
         return self._edge_mapping
 
@@ -169,14 +176,14 @@ class VanillaSDDMMx86(SDDMMbase):
 
 
 class VanillaSDDMMcuda(SDDMMbase):
-    def __init__(self, adj_scipy, num_row_partitions=1, num_col_partitions=1):
-        super(VanillaSDDMMcuda, self).__init__(adj_scipy, num_row_partitions, num_col_partitions)
+    def __init__(self, adj_scipy):
+        super(VanillaSDDMMcuda, self).__init__(adj_scipy, num_row_partitions=1, num_col_partitions=1)
 
     def _register(self):
         self._target = 'cuda'
         self._ctx = tvm.gpu(0)
         self._compute_func = vanilla_sddmm
-        self._schedule_func = schedule_vanilla_sddmm_cuda_single_thread_reduce
+        self._schedule_func = schedule_vanilla_sddmm_cuda_tree_reduce
 
 
 class MultiHeadSDDMMx86(SDDMMbase):
@@ -191,8 +198,8 @@ class MultiHeadSDDMMx86(SDDMMbase):
 
 
 class MultiHeadSDDMMcuda(SDDMMbase):
-    def __init__(self, adj_scipy, num_row_partitions=1, num_col_partitions=1):
-        super(MultiHeadSDDMMcuda, self).__init__(adj_scipy, num_row_partitions, num_col_partitions)
+    def __init__(self, adj_scipy):
+        super(MultiHeadSDDMMcuda, self).__init__(adj_scipy, num_row_partitions=1, num_col_partitions=1)
 
     def _register(self):
         pass

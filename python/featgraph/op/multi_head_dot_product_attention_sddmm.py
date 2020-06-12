@@ -63,12 +63,12 @@ def multi_head_dot_product_attention_sddmm(SrcFeat,
         def edgefunc(eid, hid):  # eid: edge id, hid: head id
             return te.sum(ReshapedSrcFeat[hid // num_heads_per_partition, \
                                            k // feat_len_per_partition, \
-                                           Adj_row_indices[eid], \
+                                           Adj_col_indices[eid], \
                                            hid % num_heads_per_partition, \
                                            k % feat_len_per_partition] \
                            * ReshapedDstFeat[hid // num_heads_per_partition, \
                                              k // feat_len_per_partition, \
-                                             Adj_col_indices[eid], \
+                                             Adj_row_indices[eid], \
                                              hid % num_heads_per_partition, \
                                              k % feat_len_per_partition], axis=k)
 
