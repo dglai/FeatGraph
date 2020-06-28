@@ -1,5 +1,6 @@
 import numpy as np
 import tvm
+from tvm import te
 from topi.util import get_const_tuple
 
 from ..util import util_convert_csr_to_dds
@@ -37,35 +38,36 @@ class SpMMbase():
         self._schedule_func = None
         self._register()
         # 1D graph partitioning
-        if self._num_col_partitions > 1:
-            adj_s1_pos, adj_s1_idx, adj_vals = self._preprocess_adj(adj_scipy_csr, self._num_col_partitions)
-            self._adj_s1_pos = adj_s1_pos
-            self._adj_s1_idx = adj_s1_idx
-            self._adj_vals = adj_vals
-            self._adj_s1_pos_placeholder = tvm.placeholder(shape=self._adj_s1_pos.shape, \
-                dtype=str(self._adj_s1_pos.dtype), name='adj_s1_pos_placeholder')
-            self._adj_s1_idx_placeholder = tvm.placeholder(shape=self._adj_s1_idx.shape, \
-                dtype=str(self._adj_s1_idx.dtype), name='adj_s1_idx_placeholder')
-            self._adj_vals_placeholder = tvm.placeholder(shape=self._adj_vals.shape, \
-                dtype=str(self._adj_vals.dtype), name='adj_vals_placeholder')
-            self._adj_s1_pos_tvm = tvm.nd.array(self._adj_s1_pos, ctx=self._ctx)
-            self._adj_s1_idx_tvm = tvm.nd.array(self._adj_s1_idx, ctx=self._ctx)
-            self._adj_vals_tvm = tvm.nd.array(self._adj_vals, ctx=self._ctx)
-            self._adj_d1_size = self._num_col_partitions
-            self._adj_d2_size = self._num_rows + 1
-        else:
-            self._adj_indptr = adj_scipy_csr.indptr
-            self._adj_indices = adj_scipy_csr.indices
-            self._adj_vals = adj_scipy_csr.data
-            self._adj_indptr_placeholder = tvm.placeholder(shape=self._adj_indptr.shape, \
-                dtype=str(self._adj_indptr.dtype), name='adj_indptr_placeholder')
-            self._adj_indices_placeholder = tvm.placeholder(shape=self._adj_indices.shape, \
-                dtype=str(self._adj_indices.dtype), name='adj_indices_placeholder')
-            self._adj_vals_placeholder = tvm.placeholder(shape=self._adj_vals.shape, \
-                dtype=str(self._adj_vals.dtype), name='adj_vals_placeholder')
-            self._adj_indptr_tvm = tvm.nd.array(self._adj_indptr, ctx=self._ctx)
-            self._adj_indices_tvm = tvm.nd.array(self._adj_indices, ctx=self._ctx)
-            self._adj_vals_tvm = tvm.nd.array(self._adj_vals, ctx=self._ctx)
+        # if self._num_col_partitions > 1:
+        #     adj_s1_pos, adj_s1_idx, adj_vals = self._preprocess_adj(adj_scipy_csr, self._num_col_partitions)
+        #     self._adj_s1_pos = adj_s1_pos
+        #     self._adj_s1_idx = adj_s1_idx
+        #     self._adj_vals = adj_vals
+        #     self._adj_s1_pos_placeholder = tvm.placeholder(shape=self._adj_s1_pos.shape, \
+        #         dtype=str(self._adj_s1_pos.dtype), name='adj_s1_pos_placeholder')
+        #     self._adj_s1_idx_placeholder = tvm.placeholder(shape=self._adj_s1_idx.shape, \
+        #         dtype=str(self._adj_s1_idx.dtype), name='adj_s1_idx_placeholder')
+        #     self._adj_vals_placeholder = tvm.placeholder(shape=self._adj_vals.shape, \
+        #         dtype=str(self._adj_vals.dtype), name='adj_vals_placeholder')
+        #     self._adj_s1_pos_tvm = tvm.nd.array(self._adj_s1_pos, ctx=self._ctx)
+        #     self._adj_s1_idx_tvm = tvm.nd.array(self._adj_s1_idx, ctx=self._ctx)
+        #     self._adj_vals_tvm = tvm.nd.array(self._adj_vals, ctx=self._ctx)
+        #     self._adj_d1_size = self._num_col_partitions
+        #     self._adj_d2_size = self._num_rows + 1
+        # else:
+        self._adj_indptr = adj_scipy_csr.indptr
+        self._adj_indices = adj_scipy_csr.indices
+        self._adj_vals = adj_scipy_csr.data
+        self._adj_indptr_placeholder = te.placeholder(shape=self._adj_indptr.shape, \
+            dtype=str(self._adj_indptr.dtype), name='adj_indptr_placeholder')
+        self._adj_indices_placeholder = te.placeholder(shape=self._adj_indices.shape, \
+            dtype=str(self._adj_indices.dtype), name='adj_indices_placeholder')
+        self._adj_vals_placeholder = te.placeholder(shape=self._adj_vals.shape, \
+            dtype=str(self._adj_vals.dtype), name='adj_vals_placeholder')
+        self._adj_indptr_tvm = tvm.nd.array(self._adj_indptr, ctx=self._ctx)
+        self._adj_indices_tvm = tvm.nd.array(self._adj_indices, ctx=self._ctx)
+        self._adj_vals_tvm = tvm.nd.array(self._adj_vals, ctx=self._ctx)
+
         # To be updated in self.build
         self._func = None
         # To be updated in self.run
@@ -91,23 +93,23 @@ class SpMMbase():
         schedule_args : dict
             Arguments required for schedule_func, e.g., num_cuda_blocks
         """
-        if self._num_col_partitions > 1:
-            out_placeholder = self._compute_func(*input_placeholders, self._adj_s1_pos_placeholder, \
-                self._adj_s1_idx_placeholder, self._adj_vals_placeholder,
-                self._adj_d1_size, self._adj_d2_size, **compute_args)  # use ** to unpack dict into kwargs
-            s = self._schedule_func(out_placeholder, **schedule_args)
-            self._func = tvm.build(s, [*input_placeholders, self._adj_s1_pos_placeholder, \
-                self._adj_s1_idx_placeholder, self._adj_vals_placeholder, out_placeholder], target=self._target)
-            self.out_tvm = tvm.nd.array(np.zeros(shape=get_const_tuple(out_placeholder.shape), \
-                dtype=str(out_placeholder.dtype)), ctx=self._ctx)
-        else:
-            out_placeholder = self._compute_func(*input_placeholders, self._adj_indptr_placeholder, \
-                self._adj_indices_placeholder, self._adj_vals_placeholder, **compute_args)
-            s = self._schedule_func(out_placeholder, **schedule_args)
-            self._func = tvm.build(s, [*input_placeholders, self._adj_indptr_placeholder, \
-                self._adj_indices_placeholder, self._adj_vals_placeholder, out_placeholder], target=self._target)
-            self.out_tvm = tvm.nd.array(np.zeros(shape=get_const_tuple(out_placeholder.shape), \
-                dtype=str(out_placeholder.dtype)), ctx=self._ctx)
+        # if self._num_col_partitions > 1:
+        #     out_placeholder = self._compute_func(*input_placeholders, self._adj_s1_pos_placeholder, \
+        #         self._adj_s1_idx_placeholder, self._adj_vals_placeholder,
+        #         self._adj_d1_size, self._adj_d2_size, **compute_args)  # use ** to unpack dict into kwargs
+        #     s = self._schedule_func(out_placeholder, **schedule_args)
+        #     self._func = tvm.build(s, [*input_placeholders, self._adj_s1_pos_placeholder, \
+        #         self._adj_s1_idx_placeholder, self._adj_vals_placeholder, out_placeholder], target=self._target)
+        #     self.out_tvm = tvm.nd.array(np.zeros(shape=get_const_tuple(out_placeholder.shape), \
+        #         dtype=str(out_placeholder.dtype)), ctx=self._ctx)
+        # else:
+        out_placeholder = self._compute_func(*input_placeholders, self._adj_indptr_placeholder, \
+            self._adj_indices_placeholder, self._adj_vals_placeholder, **compute_args)
+        s = self._schedule_func(out_placeholder, **schedule_args)
+        self._func = tvm.build(s, [*input_placeholders, self._adj_indptr_placeholder, \
+            self._adj_indices_placeholder, self._adj_vals_placeholder, out_placeholder], target=self._target)
+        self.out_tvm = tvm.nd.array(np.zeros(shape=get_const_tuple(out_placeholder.shape), \
+            dtype=str(out_placeholder.dtype)), ctx=self._ctx)
 
     def lower_to_ir(self, input_placeholders, compute_args, schedule_args):
         """Return the IR. This can be useful for debug.
@@ -137,6 +139,11 @@ class SpMMbase():
             ir = tvm.lower(s, [*input_placeholders, self._adj_indptr_placeholder, \
                 self._adj_indices_placeholder, self._adj_vals_placeholder, out_placeholder], simple_mode=True)
         return ir
+
+    def cuda_source(self):
+        assert self._target == 'cuda', "Target is not cuda."
+        assert self._func is not None, "Module must be built first"
+        return self._func.imported_modules[0].get_source()
 
     def run(self, input_tvm_ndarrays):
         """Run the built func with the given inputs input_tvm_ndarrays.

@@ -32,11 +32,14 @@ class SDDMMbase():
             adj_scipy_coo = adj_scipy
         self._num_rows = adj_scipy_coo.shape[0]
         self._num_cols = adj_scipy_coo.shape[1]
-        assert num_row_partitions >= 1, "num_row_partitions should be larger than or equal to 1"
-        assert num_col_partitions >= 1, "num_col_partitions should be larger than or equal to 1"
-        self._num_row_partitions = num_row_partitions
-        self._num_col_partitions = num_row_partitions
+        # assert num_row_partitions >= 1, "num_row_partitions should be larger than or equal to 1"
+        # assert num_col_partitions >= 1, "num_col_partitions should be larger than or equal to 1"
+        # self._num_row_partitions = num_row_partitions
+        # self._num_col_partitions = num_row_partitions
+        self._num_row_partitions = 1
+        self._num_col_partitions = 1
         # To be updated in self.register
+        # TODO uselhs userhs
         self._target = None
         self._ctx = None
         self._compute_func = None
@@ -53,9 +56,9 @@ class SDDMMbase():
             adj_col_indices = adj_scipy_coo.col
         self._adj_row_indices = adj_row_indices
         self._adj_col_indices = adj_col_indices
-        self._adj_row_indices_placeholder = tvm.placeholder(shape=self._adj_row_indices.shape, \
+        self._adj_row_indices_placeholder = te.placeholder(shape=self._adj_row_indices.shape, \
             dtype=str(self._adj_row_indices.dtype), name='adj_row_indices_placeholder')
-        self._adj_col_indices_placeholder = tvm.placeholder(shape=self._adj_col_indices.shape, \
+        self._adj_col_indices_placeholder = te.placeholder(shape=self._adj_col_indices.shape, \
             dtype=str(self._adj_col_indices.dtype), name='adj_col_indices_placeholder')
         self._adj_row_indices_tvm = tvm.nd.array(self._adj_row_indices, ctx=self._ctx)
         self._adj_col_indices_tvm = tvm.nd.array(self._adj_col_indices, ctx=self._ctx)
@@ -91,10 +94,11 @@ class SDDMMbase():
         Out_placeholder = self._compute_func(*input_placeholders, Adj_row_indices_placeholder, \
             Adj_col_indices_placeholder, **compute_args)  # use ** to unpack dict into kwargs
         s = self._schedule_func(Out_placeholder, **schedule_args)
-        # s[a].compute_inline()
-        # s[b].compute_inline()
-        self._func = tvm.build(s, [*input_placeholders, Adj_row_indices_placeholder, \
-            Adj_col_indices_placeholder, Out_placeholder], target=self._target)
+        module_input = [*input_placeholders]
+        if compute_args['use_bcast']:
+            module_input += [compute_args['lhs_off'], compute_args['rhs_off']]
+        module_input += [Adj_row_indices_placeholder, Adj_col_indices_placeholder, Out_placeholder]
+        self._func = tvm.build(s, module_input, target=self._target, name='sddmm')
         self._adj_row_indices_tvm = tvm.nd.array(self._adj_row_indices, ctx=self._ctx)
         self._adj_col_indices_tvm = tvm.nd.array(self._adj_col_indices, ctx=self._ctx)
         self.out_tvm = tvm.nd.array(np.zeros(shape=get_const_tuple(Out_placeholder.shape), dtype=str(Out_placeholder.dtype)), ctx=self._ctx)
@@ -131,8 +135,11 @@ class SDDMMbase():
         assert self._func is not None, "Module must be built first"
         return self._func.imported_modules[0].get_source()
 
+    def export_library(self, path):
+        assert self._func is not None, "Module must be built first"
+        self._func.export_library(path)
 
-    def run(self, feat_tvm_ndarrays):
+    def run(self, input_tvm_ndarrays):
         """Run the built func with the given inputs feat_tvm_ndarrays.
 
         Parameters
@@ -175,9 +182,19 @@ class VanillaSDDMMx86(SDDMMbase):
         self._schedule_func = schedule_vanilla_sddmm_x86
 
 
-class VanillaSDDMMcuda(SDDMMbase):
+class SDDMMcuda_elemwise(SDDMMbase):
     def __init__(self, adj_scipy):
-        super(VanillaSDDMMcuda, self).__init__(adj_scipy, num_row_partitions=1, num_col_partitions=1)
+        super(SDDMMcuda_elemwise, self).__init__(adj_scipy, num_row_partitions=1, num_col_partitions=1)
+
+    def _register(self):
+        self._target = 'cuda'
+        self._ctx = tvm.gpu(0)
+        self._compute_func = vanilla_sddmm
+        self._schedule_func = schedule_vanilla_sddmm_cuda_single_thread_reduce
+
+class SDDMMcuda_reduce(SDDMMbase):
+    def __init__(self, adj_scipy):
+        super(SDDMMcuda_reduce, self).__init__(adj_scipy, num_row_partitions=1, num_col_partitions=1)
 
     def _register(self):
         self._target = 'cuda'
