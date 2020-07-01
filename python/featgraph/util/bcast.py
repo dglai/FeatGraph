@@ -48,7 +48,7 @@ def calc_bcast(op, lhs, rhs):
         rst_out_len = rhs_len if op == 'copy_e' else lhs_len
         if op == 'dot':
             reduce_size = lhs.shape[lhs_ndim-1]
-            rst_out_len /= reduce_size
+            rst_out_len //= reduce_size
     return if_bcast, lhs_len, rhs_len, rst_out_len, reduce_size, np.array(lhs_off).astype('int32'), np.array(rhs_off).astype('int32')
 
 if __name__ == '__main__':
