@@ -54,7 +54,8 @@ def gspmm(binary_op, reduce_op, indice_type='int32', feature_type='float32', use
     def msgfunc(row, fid):
         row_start = adj_indptr[row]
         # row_end = adj_indptr[tvm.tir.Add(row, tvm.tir.IntImm(dtype=row.dtype, value=1))]
-        row_end = adj_indptr[tvm.tir.Add(row, 1)]
+        # print(row.dtype, one.dtype, (row+one).dtype, tvm.tir.Add(row,one).dtype)
+        row_end = adj_indptr[row + 1]
         row_num_elems = row_end - row_start
         elem_idx = te.reduce_axis((0, row_num_elems), name="elem_idx")
         adj_val = edge_feat[row_start + elem_idx, rhs_off[fid] if use_bcast else fid]
@@ -75,17 +76,17 @@ def gspmm(binary_op, reduce_op, indice_type='int32', feature_type='float32', use
     elif target == 'cuda':
         # ntx = find_num_threads(out_len, 1024)
         # nty = 1024 // ntx
-        # edge_axis, feat_axis = out.op.axis[0], out.op.axis[1]
+        edge_axis, feat_axis = out.op.axis[0], out.op.axis[1]
         # edge_outer, edge_inner = s[out].split(edge_axis, factor=ntx)
         # feat_outer, feat_inner = s[out].split(feat_axis, factor=nty)
         # s[out].bind(feat_outer, te.thread_axis('blockIdx.x'))
         # s[out].bind(feat_inner, te.thread_axis('threadIdx.x'))
         # s[out].bind(edge_outer, te.thread_axis('blockIdx.y'))
         # s[out].bind(edge_inner, te.thread_axis('threadIdx.y'))
-        edge_axis, feat_axis = out.op.axis[0], out.op.axis[1]
-        reduce_axis = out.op.reduce_axis[0]
+        # edge_axis, feat_axis = out.op.axis[0], out.op.axis[1]
+        # reduce_axis = out.op.reduce_axis[0]
         # single thread reduce
-        edge_outer, edge_inner = s[out].split(edge_axis, factor=1024)
+        edge_outer, edge_inner = s[out].split(edge_axis, factor=tvm.tir.IntImm(dtype=indice_type, value=1024))
         s[out].bind(edge_outer, te.thread_axis('blockIdx.x'))
         s[out].bind(edge_inner, te.thread_axis('threadIdx.x'))
         # tree reduce
@@ -116,10 +117,10 @@ def build_all(target, dir = None):
 if __name__ == '__main__':
     import scipy, logging
     target = 'cuda'
-    # f = build_all(target)
-    ir = gspmm('add', 'sum', indice_type='int64', feature_type='float32', target=target, use_bcast=False)
-    print(ir)
-    f = tvm.build(ir, target=target)
+    f = build_all(target)
+    # ir = gspmm('add', 'sum', indice_type='int32', feature_type='float32', target=target, use_bcast=False)
+    # print(ir)
+    # f = tvm.build(ir, target=target)
     # print(f.imported_modules[0].get_source())
     # adj_scipy_coo = scipy.sparse.random(2**15, 2**15, density=0.001, format='coo').astype('int32')
     # evaluate_time()
