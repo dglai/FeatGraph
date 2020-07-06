@@ -67,13 +67,19 @@ def gsddmm(binary_op, indice_type='int32', feature_type='float32', use_bcast=Fal
             name='out'
         )
     # prepare input
-    f_input = [adj_row_indices, adj_col_indices, src_feat, dst_feat]
+    f_input = [adj_row_indices, adj_col_indices]
     f_name = 'sddmm_{}_{}_{}'.format(binary_op, indice_type, feature_type)
+    if binary_op == 'copy_u':
+        f_input.append(src_feat)
+    elif binary_op == 'copy_v':
+        f_input.append(dst_feat)
+    else:
+        f_input += [src_feat, dst_feat]
+    if binary_op == 'dot':
+        f_input.append(reduce_size)
     if use_bcast:
         f_input += [lhs_off, rhs_off]
         f_name += '_bcast'
-    if binary_op == 'dot':
-        f_input.append(reduce_size)
     f_input.append(out)
     # schedule
     s = te.create_schedule(out.op)
@@ -131,11 +137,17 @@ def sddmm(binary_op, nnz, num_rows, num_cols,
             name='out'
         )
     # prepare input
-    f_input = [adj_row_indices, adj_col_indices, src_feat, dst_feat]
+    f_input = [adj_row_indices, adj_col_indices]
     f_name = '_'.join(str(x) for x in [
         'sddmm', binary_op, nnz, num_rows, num_cols,
          lhs_len, rhs_len, out_len, indice_type, feat_type
          ])
+    if binary_op == 'copy_u':
+        f_input.append(src_feat)
+    elif binary_op == 'copy_v':
+        f_input.append(dst_feat)
+    else:
+        f_input += [src_feat, dst_feat]
     if use_bcast:
         f_input += [lhs_off, rhs_off]
         f_name += '_bcast'
@@ -210,7 +222,8 @@ if __name__ == '__main__':
     indice_type = str(adj_scipy_coo.row.dtype)
     feat_len = 64
     feat_type = 'float32'
-    f = sddmm('dot', nnz, num_rows, num_cols, feat_len, indice_type, feat_type, reduce_size=16, target=target)
+    f = sddmm('dot', nnz, num_rows, num_cols, feat_len, feat_len, feat_len,
+              indice_type, feat_type, reduce_size=16, target=target)
     print(f.imported_modules[0].get_source())
     # src_feat = np.random.random((num_rows, feat_len)).astype('float32')
     # dst_feat = np.random.random((num_cols, feat_len)).astype('float32')

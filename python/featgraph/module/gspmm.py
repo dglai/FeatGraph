@@ -60,7 +60,13 @@ def gspmm(binary_op, reduce_op, indice_type='int32', feature_type='float32', use
         return reduce_op_map[reduce_op](binary_op_map[binary_op](feat_val, adj_val), axis=elem_idx)
     out = te.compute((num_rows, out_len), msgfunc, name='out')
     # prepare input
-    f_input = [adj_indptr, adj_indices, node_feat, edge_feat]
+    f_input = [adj_indptr, adj_indices]
+    if binary_op == 'copy_u':
+        f_input.append(node_feat)
+    elif binary_op == 'copy_e':
+        f_input.append(edge_feat)
+    else:
+        f_input += [node_feat, edge_feat]
     f_name = 'spmm_{}_{}_{}_{}'.format(binary_op, reduce_op, indice_type, feature_type)
     if use_bcast:
         f_input += [lhs_off, rhs_off]
@@ -72,9 +78,9 @@ def gspmm(binary_op, reduce_op, indice_type='int32', feature_type='float32', use
         pass
     elif target == 'cuda':
         edge_axis, feat_axis = out.op.axis[0], out.op.axis[1]
-        edge_outer, edge_inner = s[out].split(edge_axis, factor=tvm.tir.IntImm(dtype=indice_type, value=1024))
-        s[out].bind(edge_outer, te.thread_axis('blockIdx.x'))
-        s[out].bind(edge_inner, te.thread_axis('threadIdx.x'))
+        feat_outer, feat_inner = s[out].split(edge_axis, factor=out_len)
+        s[out].bind(feat_outer, te.thread_axis('blockIdx.x'))
+        s[out].bind(feat_inner, te.thread_axis('threadIdx.x'))
     return tvm.lower(s, f_input, name=f_name)
 
 def spmm(binary_op, reduce_op, nnz, num_rows, num_cols, 
@@ -100,11 +106,17 @@ def spmm(binary_op, reduce_op, nnz, num_rows, num_cols,
         return reduce_op_map[reduce_op](binary_op_map[binary_op](feat_val, adj_val), axis=elem_idx)
     out = te.compute((num_rows, out_len), msgfunc, name='out')
     # prepare input
-    f_input = [adj_indptr, adj_indices, node_feat, edge_feat]
+    f_input = [adj_indptr, adj_indices]
     f_name = '_'.join(str(x) for x in [
         'spmm', binary_op, reduce_op, nnz, num_rows, 
         num_cols, out_len, indice_type, feat_type
         ])
+    if binary_op == 'copy_u':
+        f_input.append(node_feat)
+    elif binary_op == 'copy_e':
+        f_input.append(edge_feat)
+    else:
+        f_input += [node_feat, edge_feat]
     if use_bcast:
         f_input += [lhs_off, rhs_off]
         f_name += '_bcast'
@@ -114,22 +126,22 @@ def spmm(binary_op, reduce_op, nnz, num_rows, num_cols,
     edge_axis, feat_axis = out.op.axis
     if target == 'cuda':
         # cuda schedule
-        # ntx = tvm.autotvm.task.space.get_pow2s(out_len)[-1]
-        # ntx = 1024 if ntx > 1024 else ntx
-        # nty = 1024 // ntx
-        # fo, fi = s[out].split(feat_axis, factor=ntx)
-        # eo, ei = s[out].split(edge_axis, factor=nty)
-        # nby = (nnz + nty - 1) // nty
-        # if nby > 65535:
-        #     eo, e = s[out].split(eo, nparts = 65535)
-        #     s[out].reorder(e, eo, ei, fo, fi)
+        ntx = tvm.autotvm.task.space.get_pow2s(out_len)[-1]
+        ntx = 1024 if ntx > 1024 else ntx
+        nty = 1024 // ntx
+        fo, fi = s[out].split(feat_axis, factor=ntx)
+        eo, ei = s[out].split(edge_axis, factor=nty)
+        nby = (nnz + nty - 1) // nty
+        if nby > 65535:
+            eo, e = s[out].split(eo, nparts = 65535)
+            s[out].reorder(e, eo, ei, fo, fi)
+        s[out].bind(fi, te.thread_axis('threadIdx.x'))
+        s[out].bind(fo, te.thread_axis('blockIdx.x'))
+        s[out].bind(ei, te.thread_axis('threadIdx.y'))
+        s[out].bind(eo, te.thread_axis('blockIdx.y'))
+        # fo, fi = s[out].split(feat_axis, factor=out_len)
         # s[out].bind(fi, te.thread_axis('threadIdx.x'))
         # s[out].bind(fo, te.thread_axis('blockIdx.x'))
-        # s[out].bind(ei, te.thread_axis('threadIdx.y'))
-        # s[out].bind(eo, te.thread_axis('blockIdx.y'))
-        eo, ei = s[out].split(edge_axis, factor=1024)
-        s[out].bind(ei, te.thread_axis('threadIdx.x'))
-        s[out].bind(eo, te.thread_axis('blockIdx.x'))
     else:
         # llvm schedule
         pass
