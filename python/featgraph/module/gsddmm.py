@@ -95,8 +95,81 @@ def gsddmm(binary_op, indice_type='int32', feature_type='float32', use_bcast=Fal
         s[out].bind(edge_inner, te.thread_axis('threadIdx.x'))
     return tvm.lower(s, f_input, name=f_name)
 
-def sddmm():
-    pass
+def sddmm(binary_op, nnz, num_rows, num_cols, 
+          lhs_len, rhs_len, out_len, 
+          indice_type, feat_type, reduce_size=1, 
+          use_bcast=False, target='llvm'):
+    # placeholder for sparse matrix
+    adj_row_indices = te.placeholder((nnz,), indice_type, 'adj_row_indices')
+    adj_col_indices = te.placeholder((nnz,), indice_type, 'adj_col_indices')
+    # placeholder for dense features
+    src_feat = te.placeholder((num_rows, lhs_len), feat_type, 'src_feat')
+    dst_feat = te.placeholder((num_cols, rhs_len), feat_type, 'dst_feat')
+    # placeholder for possible broadcasting offset
+    lhs_off = te.placeholder((out_len,), indice_type, 'lhs_off')
+    rhs_off = te.placeholder((out_len,), indice_type, 'rhs_off')
+    # compute
+    if binary_op == 'dot':
+        out_len = feat_len // reduce_size
+        k = te.reduce_axis((0, reduce_size), name='k')
+        out = te.compute(
+            (nnz, out_len),
+            lambda eid, fid: te.sum(
+                src_feat[adj_row_indices[eid], (lhs_off[fid] if use_bcast else fid) * reduce_size + k] * \
+                dst_feat[adj_col_indices[eid], (rhs_off[fid] if use_bcast else fid) * reduce_size + k],
+                axis=k
+            ),
+            name='out'
+        )
+    else:
+        out = te.compute(
+            (nnz, feat_len), 
+            lambda eid, fid: binary_op_map[binary_op](
+                src_feat[adj_row_indices[eid], lhs_off[fid] if use_bcast else fid], \
+                dst_feat[adj_col_indices[eid], rhs_off[fid] if use_bcast else fid]
+            ),
+            name='out'
+        )
+    # prepare input
+    f_input = [adj_row_indices, adj_col_indices, src_feat, dst_feat]
+    f_name = '_'.join(str(x) for x in [
+        'sddmm', binary_op, nnz, num_rows, num_cols,
+         lhs_len, rhs_len, out_len, indice_type, feat_type
+         ])
+    if use_bcast:
+        f_input += [lhs_off, rhs_off]
+        f_name += '_bcast'
+    f_input.append(out)
+    # schedule
+    s = te.create_schedule(out.op)
+    edge_axis, feat_axis = out.op.axis
+    if target == 'cuda':
+        # cuda schedule
+        if binary_op != 'dot':
+            ntx = tvm.autotvm.task.space.get_pow2s(feat_len)[-1]
+            ntx = 1024 if ntx > 1024 else ntx
+            nty = 1024 // ntx
+            fo, fi = s[out].split(feat_axis, factor=ntx)
+            eo, ei = s[out].split(edge_axis, factor=nty)
+            nby = (nnz + nty - 1) // nty
+            if nby > 65535:
+                eo, e = s[out].split(eo, nparts = 65535)
+                s[out].reorder(eo, e, ei, fo, fi)
+                s[out].bind(fi, te.thread_axis('threadIdx.x'))
+                s[out].bind(fo, te.thread_axis('blockIdx.x'))
+                s[out].bind(ei, te.thread_axis('threadIdx.y'))
+                s[out].bind(eo, te.thread_axis('blockIdx.y'))
+        else:
+            # if dot product, use tree reduction
+            reduce_axis = out.op.reduce_axis[0]
+
+            eo, ei = s[out].split(edge_axis, factor = (1024 // feat_len))
+            s[out].bind(reduce_axis, te.thread_axis('threadIdx.x'))
+            s[out].bind(ei, te.thread_axis('threadIdx.y'))
+            s[out].bind(eo, te.thread_axis('blockIdx.x'))
+    else:
+        pass
+    return tvm.build(s, f_input, target=target, name=f_name)
 
 def build_all(target, dir = None):
     # build a .so library packing all kinds of kernel for a target(cuda/llvm)
@@ -112,16 +185,62 @@ def build_all(target, dir = None):
         f.export_library(dir + '/libgsddmm_tvm_' + target + '.so')
     return f
 
+# def sddmm_tune(adj_scipy_coo, feat_len, feat_type, binary_op, reduce_size=1, target='llvm'):
+#     nnz = adj_scipy_coo.row.shape[0]
+#     num_rows = adj_scipy_coo.shape[0]
+#     num_cols = adj_scipy_coo.shape[1]
+#     indice_type = str(adj_scipy_coo.row.dtype)
+#     sddmm = autotvm.task.create('sddmm', args=(binary_op, nnz, num_rows, num_cols, feat_len, indice_type, feat_type, reduce_size), target=target)
+#     return sddmm
+
 
 if __name__ == '__main__':
-    import scipy, logging
+    import scipy, logging, sys
     target = 'cuda'
     # f = build_all(target)
-    ir = gsddmm('add', indice_type='int32', feature_type='float32', target=target, use_bcast=False)
+    # ir = gsddmm('add', indice_type='int32', feature_type='float32', target=target, use_bcast=False)
     # print(ir)
-    f = tvm.build(ir, target=target)
-    print(f.imported_modules[0].get_source())
-    # adj_scipy_coo = scipy.sparse.random(2**15, 2**15, density=0.001, format='coo').astype('int32')
+    # f = tvm.build(ir, target=target)
+    # print(f.imported_modules[0].get_source())
+    adj_scipy_coo = scipy.sparse.random(2**12, 2**12, density=0.1, format='coo').astype('int32')
     # evaluate_time()
+    nnz = adj_scipy_coo.row.shape[0]
+    num_rows = adj_scipy_coo.shape[0]
+    num_cols = adj_scipy_coo.shape[1]
+    indice_type = str(adj_scipy_coo.row.dtype)
+    feat_len = 64
+    feat_type = 'float32'
+    f = sddmm('dot', nnz, num_rows, num_cols, feat_len, indice_type, feat_type, reduce_size=16, target=target)
+    print(f.imported_modules[0].get_source())
+    # src_feat = np.random.random((num_rows, feat_len)).astype('float32')
+    # dst_feat = np.random.random((num_cols, feat_len)).astype('float32')
+    # out = np.zeros((nnz, feat_len)).astype('float32')
+    # f_input = [adj_scipy_coo.row, adj_scipy_coo.col, src_feat, dst_feat, out]
+    # ctx = tvm.cpu(0) if target == 'llvm' else tvm.gpu(0)
+    # f_input = [tvm.nd.array(x, ctx=ctx) for x in f_input]
+    # f(*f_input)
+
+
+
+
+    #autotvm
+
+    # # logging config (for printing tuning log to the screen)
+    # logging.getLogger('autotvm').setLevel(logging.DEBUG)
+    # logging.getLogger('autotvm').addHandler(logging.StreamHandler(sys.stdout))
+
+    # # There are two steps for measuring a config: build and run.
+    # # By default, we use all CPU cores to compile program. Then measure them sequentially.
+    # # We measure 5 times and take average to reduce variance.
+    # measure_option = autotvm.measure_option(
+    #     builder='local',
+    #     runner=autotvm.LocalRunner(number=5))
+
+    # task = sddmm_tune(adj_scipy_coo, 32, 'float32', 'add', target='cuda')
+    # print(task.config_space)
+    # tuner = autotvm.tuner.XGBTuner(task)
+    # tuner.tune(n_trial=10,
+    #         measure_option=measure_option,
+    #         callbacks=[autotvm.callback.log_to_file('sddmm.log')])
 
 
