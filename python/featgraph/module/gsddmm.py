@@ -116,7 +116,6 @@ def sddmm(binary_op, nnz, num_rows, num_cols,
     rhs_off = te.placeholder((out_len,), indice_type, 'rhs_off')
     # compute
     if binary_op == 'dot':
-        out_len = feat_len // reduce_size
         k = te.reduce_axis((0, reduce_size), name='k')
         out = te.compute(
             (nnz, out_len),
@@ -129,7 +128,7 @@ def sddmm(binary_op, nnz, num_rows, num_cols,
         )
     else:
         out = te.compute(
-            (nnz, feat_len), 
+            (nnz, out_len), 
             lambda eid, fid: binary_op_map[binary_op](
                 src_feat[adj_row_indices[eid], lhs_off[fid] if use_bcast else fid], \
                 dst_feat[adj_col_indices[eid], rhs_off[fid] if use_bcast else fid]
@@ -158,7 +157,7 @@ def sddmm(binary_op, nnz, num_rows, num_cols,
     if target == 'cuda':
         # cuda schedule
         if binary_op != 'dot':
-            ntx = tvm.autotvm.task.space.get_pow2s(feat_len)[-1]
+            ntx = tvm.autotvm.task.space.get_pow2s(out_len)[-1]
             ntx = 1024 if ntx > 1024 else ntx
             nty = 1024 // ntx
             fo, fi = s[out].split(feat_axis, factor=ntx)
@@ -174,13 +173,17 @@ def sddmm(binary_op, nnz, num_rows, num_cols,
         else:
             # if dot product, use tree reduction
             reduce_axis = out.op.reduce_axis[0]
-
-            eo, ei = s[out].split(edge_axis, factor = (1024 // feat_len))
+            eo, ei = s[out].split(edge_axis, factor = (1024 // out_len))
             s[out].bind(reduce_axis, te.thread_axis('threadIdx.x'))
             s[out].bind(ei, te.thread_axis('threadIdx.y'))
             s[out].bind(eo, te.thread_axis('blockIdx.x'))
-    else:
-        pass
+    elif target == 'llvm':
+        # pass
+        s[out].parallel(edge_axis)
+        s[out].pragma(edge_axis, 'parallel_launch_point')
+        s[out].pragma(edge_axis, 'parallel_stride_pattern', 8)
+        s[out].vectorize(feat_axis)
+        # print(tvm.lower(s, f_input))
     return tvm.build(s, f_input, target=target, name=f_name)
 
 def build_all(target, dir = None):
@@ -205,7 +208,6 @@ def build_all(target, dir = None):
 #     sddmm = autotvm.task.create('sddmm', args=(binary_op, nnz, num_rows, num_cols, feat_len, indice_type, feat_type, reduce_size), target=target)
 #     return sddmm
 
-
 if __name__ == '__main__':
     import scipy, logging, sys
     target = 'cuda'
@@ -214,17 +216,17 @@ if __name__ == '__main__':
     # print(ir)
     # f = tvm.build(ir, target=target)
     # print(f.imported_modules[0].get_source())
-    adj_scipy_coo = scipy.sparse.random(2**12, 2**12, density=0.1, format='coo').astype('int32')
+    # adj_scipy_coo = scipy.sparse.random(2**12, 2**12, density=0.1, format='coo').astype('int32')
     # evaluate_time()
-    nnz = adj_scipy_coo.row.shape[0]
-    num_rows = adj_scipy_coo.shape[0]
-    num_cols = adj_scipy_coo.shape[1]
-    indice_type = str(adj_scipy_coo.row.dtype)
-    feat_len = 64
-    feat_type = 'float32'
-    f = sddmm('dot', nnz, num_rows, num_cols, feat_len, feat_len, feat_len,
-              indice_type, feat_type, reduce_size=16, target=target)
-    print(f.imported_modules[0].get_source())
+    # nnz = adj_scipy_coo.row.shape[0]
+    # num_rows = adj_scipy_coo.shape[0]
+    # num_cols = adj_scipy_coo.shape[1]
+    # indice_type = str(adj_scipy_coo.row.dtype)
+    # feat_len = 64
+    # feat_type = 'float32'
+    # f = sddmm('dot', nnz, num_rows, num_cols, feat_len, feat_len, feat_len,
+    #           indice_type, feat_type, reduce_size=16, target=target)
+    # print(f.imported_modules[0].get_source())
     # src_feat = np.random.random((num_rows, feat_len)).astype('float32')
     # dst_feat = np.random.random((num_cols, feat_len)).astype('float32')
     # out = np.zeros((nnz, feat_len)).astype('float32')
@@ -234,26 +236,5 @@ if __name__ == '__main__':
     # f(*f_input)
 
 
-
-
-    #autotvm
-
-    # # logging config (for printing tuning log to the screen)
-    # logging.getLogger('autotvm').setLevel(logging.DEBUG)
-    # logging.getLogger('autotvm').addHandler(logging.StreamHandler(sys.stdout))
-
-    # # There are two steps for measuring a config: build and run.
-    # # By default, we use all CPU cores to compile program. Then measure them sequentially.
-    # # We measure 5 times and take average to reduce variance.
-    # measure_option = autotvm.measure_option(
-    #     builder='local',
-    #     runner=autotvm.LocalRunner(number=5))
-
-    # task = sddmm_tune(adj_scipy_coo, 32, 'float32', 'add', target='cuda')
-    # print(task.config_space)
-    # tuner = autotvm.tuner.XGBTuner(task)
-    # tuner.tune(n_trial=10,
-    #         measure_option=measure_option,
-    #         callbacks=[autotvm.callback.log_to_file('sddmm.log')])
 
 
