@@ -178,11 +178,11 @@ def sddmm(binary_op, nnz, num_rows, num_cols,
             s[out].bind(ei, te.thread_axis('threadIdx.y'))
             s[out].bind(eo, te.thread_axis('blockIdx.x'))
     elif target == 'llvm':
-        # pass
-        s[out].parallel(edge_axis)
-        s[out].pragma(edge_axis, 'parallel_launch_point')
-        s[out].pragma(edge_axis, 'parallel_stride_pattern', 8)
-        s[out].vectorize(feat_axis)
+        pass
+        # s[out].parallel(edge_axis)
+        # s[out].pragma(edge_axis, 'parallel_launch_point')
+        # s[out].pragma(edge_axis, 'parallel_stride_pattern', 8)
+        # s[out].vectorize(feat_axis)
         # print(tvm.lower(s, f_input))
     return tvm.build(s, f_input, target=target, name=f_name)
 

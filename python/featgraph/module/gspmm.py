@@ -43,9 +43,9 @@ def gspmm(binary_op, reduce_op, indice_type='int32', feature_type='float32', use
     # placeholder for sparse matrix
     adj_indptr = te.placeholder((num_rows+1,), indice_type, 'adj_indptr')
     adj_indices = te.placeholder((nnz,), indice_type, 'adj_indices')
-    edge_feat = te.placeholder((nnz, rhs_len), feature_type, 'edge_feat')
+    dst_feat = te.placeholder((nnz, rhs_len), feature_type, 'dst_feat')
     # placeholder for dense features
-    node_feat = te.placeholder((num_cols, lhs_len), feature_type, 'src_feat')
+    src_feat = te.placeholder((num_cols, lhs_len), feature_type, 'src_feat')
     # placeholder for possible broadcasting offset
     lhs_off = te.placeholder((out_len,), indice_type, 'lhs_off')
     rhs_off = te.placeholder((out_len,), indice_type, 'rhs_off')
@@ -55,18 +55,18 @@ def gspmm(binary_op, reduce_op, indice_type='int32', feature_type='float32', use
         row_end = adj_indptr[row + 1]
         row_num_elems = row_end - row_start
         elem_idx = te.reduce_axis((0, row_num_elems), name="elem_idx")
-        adj_val = edge_feat[row_start + elem_idx, rhs_off[fid] if use_bcast else fid]
-        feat_val = node_feat[adj_indices[row_start + elem_idx], lhs_off[fid] if use_bcast else fid]
+        adj_val = dst_feat[row_start + elem_idx, rhs_off[fid] if use_bcast else fid]
+        feat_val = src_feat[adj_indices[row_start + elem_idx], lhs_off[fid] if use_bcast else fid]
         return reduce_op_map[reduce_op](binary_op_map[binary_op](feat_val, adj_val), axis=elem_idx)
     out = te.compute((num_rows, out_len), msgfunc, name='out')
     # prepare input
     f_input = [adj_indptr, adj_indices]
     if binary_op == 'copy_u':
-        f_input.append(node_feat)
+        f_input.append(src_feat)
     elif binary_op == 'copy_e':
-        f_input.append(edge_feat)
+        f_input.append(dst_feat)
     else:
-        f_input += [node_feat, edge_feat]
+        f_input += [src_feat, dst_feat]
     f_name = 'spmm_{}_{}_{}_{}'.format(binary_op, reduce_op, indice_type, feature_type)
     if use_bcast:
         f_input += [lhs_off, rhs_off]
@@ -89,9 +89,9 @@ def spmm(binary_op, reduce_op, nnz, num_rows, num_cols,
     # placeholder for sparse matrix
     adj_indptr = te.placeholder((num_rows+1,), indice_type, 'adj_indptr')
     adj_indices = te.placeholder((nnz,), indice_type, 'adj_indices')
-    edge_feat = te.placeholder((nnz, rhs_len), feat_type, 'edge_feat')
+    dst_feat = te.placeholder((nnz, rhs_len), feat_type, 'dst_feat')
     # placeholder for dense features
-    node_feat = te.placeholder((num_cols, lhs_len), feat_type, 'src_feat')
+    src_feat = te.placeholder((num_cols, lhs_len), feat_type, 'src_feat')
     # placeholder for possible broadcasting offset
     lhs_off = te.placeholder((out_len,), indice_type, 'lhs_off')
     rhs_off = te.placeholder((out_len,), indice_type, 'rhs_off')
@@ -101,8 +101,8 @@ def spmm(binary_op, reduce_op, nnz, num_rows, num_cols,
         row_end = adj_indptr[row + 1]
         row_num_elems = row_end - row_start
         elem_idx = te.reduce_axis((0, row_num_elems), name="elem_idx")
-        adj_val = edge_feat[row_start + elem_idx, rhs_off[fid] if use_bcast else fid]
-        feat_val = node_feat[adj_indices[row_start + elem_idx], lhs_off[fid] if use_bcast else fid]
+        adj_val = dst_feat[row_start + elem_idx, rhs_off[fid] if use_bcast else fid]
+        feat_val = src_feat[adj_indices[row_start + elem_idx], lhs_off[fid] if use_bcast else fid]
         return reduce_op_map[reduce_op](binary_op_map[binary_op](feat_val, adj_val), axis=elem_idx)
     out = te.compute((num_rows, out_len), msgfunc, name='out')
     # prepare input
@@ -112,11 +112,11 @@ def spmm(binary_op, reduce_op, nnz, num_rows, num_cols,
         num_cols, out_len, indice_type, feat_type
         ])
     if binary_op == 'copy_u':
-        f_input.append(node_feat)
+        f_input.append(src_feat)
     elif binary_op == 'copy_e':
-        f_input.append(edge_feat)
+        f_input.append(dst_feat)
     else:
-        f_input += [node_feat, edge_feat]
+        f_input += [src_feat, dst_feat]
     if use_bcast:
         f_input += [lhs_off, rhs_off]
         f_name += '_bcast'
@@ -124,27 +124,23 @@ def spmm(binary_op, reduce_op, nnz, num_rows, num_cols,
     # schedule
     s = te.create_schedule(out.op)
     edge_axis, feat_axis = out.op.axis
+    reduce_axis = out.op.reduce_axis[0]
     if target == 'cuda':
         # cuda schedule
-        ntx = tvm.autotvm.task.space.get_pow2s(out_len)[-1]
-        ntx = 1024 if ntx > 1024 else ntx
-        nty = 1024 // ntx
-        fo, fi = s[out].split(feat_axis, factor=ntx)
-        eo, ei = s[out].split(edge_axis, factor=nty)
-        nby = (nnz + nty - 1) // nty
-        if nby > 65535:
-            eo, e = s[out].split(eo, nparts = 65535)
-            s[out].reorder(e, eo, ei, fo, fi)
-        s[out].bind(fi, te.thread_axis('threadIdx.x'))
-        s[out].bind(fo, te.thread_axis('blockIdx.x'))
-        s[out].bind(ei, te.thread_axis('threadIdx.y'))
-        s[out].bind(eo, te.thread_axis('blockIdx.y'))
-        # fo, fi = s[out].split(feat_axis, factor=out_len)
-        # s[out].bind(fi, te.thread_axis('threadIdx.x'))
-        # s[out].bind(fo, te.thread_axis('blockIdx.x'))
+        if out_len < 16:
+            # use tree reduce if feat_len is small
+            ro, ri = s[out].split(reduce_axis, factor=32)
+            s[out].bind(ri, te.thread_axis('threadIdx.x'))
+            s[out].bind(feat_axis, te.thread_axis('threadIdx.y'))
+        else:
+            #othrewise just parallel on feature dimension
+            s[out].bind(feat_axis, te.thread_axis('threadIdx.x'))
+        s[out].bind(edge_axis, te.thread_axis('blockIdx.x'))
     else:
         # llvm schedule
-        pass
+        s[out].reorder(edge_axis, reduce_axis, feat_axis)
+        # s[out].parallel(edge_axis)
+        s[out].vectorize(feat_axis)
     return tvm.build(s, f_input, target=target, name=f_name)
 
 def build_all(target, dir = None):
