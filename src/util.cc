@@ -109,13 +109,13 @@ void partition_1d(py::array_t<int> py_indptr,
             // assume the indices are sorted
             int l = memo[i];
             int r = indptr[i+1];
+            dense_indptr[(j-1)*(num_rows+1)+i] = count;
             if (l == r) continue;
             int *pos = std::lower_bound(indices+l, indices+r, col_end);
             // update memo
             memo[i] = pos - indices;
             // update count, copy data
             size_t num_elem = pos - (indices+l);
-            dense_indptr[(j-1)*(num_rows+1)+i] = count;
             std::copy(indices+l, pos, par_indices + count);
             std::copy(edge_id+l, edge_id+(pos-indices), par_edge_id+count);
             count += num_elem;
