@@ -11,15 +11,15 @@ binary_op_map = {
     'sub': lambda x,y : x-y,
     'mul': lambda x,y : x*y,
     'div': lambda x,y : x/y,
-    'copy_u' : lambda x,y : x,
-    'copy_e' : lambda x,y : y,
+    'copy_lhs' : lambda x,y : x,
+    'copy_rhs' : lambda x,y : y,
 }
 reduce_op_map = {
     'sum' : te.sum,
     'max' : te.max,
     'min' : te.min
 }
-binary_ops = ['add', 'sub', 'mul', 'div', 'copy_u', 'copy_e']
+binary_ops = ['add', 'sub', 'mul', 'div', 'copy_lhs', 'copy_rhs']
 reduce_ops = ['sum', 'max', 'min']
 indice_types = ['int32', 'int64']
 feature_types = ['float32', 'float64']
@@ -61,9 +61,9 @@ def gspmm(binary_op, reduce_op, indice_type='int32', feature_type='float32', use
     out = te.compute((num_rows, out_len), msgfunc, name='out')
     # prepare input
     f_input = [adj_indptr, adj_indices]
-    if binary_op == 'copy_u':
+    if binary_op == 'copy_lhs':
         f_input.append(src_feat)
-    elif binary_op == 'copy_e':
+    elif binary_op == 'copy_rhs':
         f_input.append(dst_feat)
     else:
         f_input += [src_feat, dst_feat]
@@ -86,6 +86,14 @@ def gspmm(binary_op, reduce_op, indice_type='int32', feature_type='float32', use
 def spmm(binary_op, reduce_op, nnz, num_rows, num_cols, 
          lhs_len, rhs_len, out_len,
          indice_type, feat_type, use_bcast=False, target='llvm'):
+    if '32' in indice_type:
+        indice_type = 'int32'
+    elif '64' in indice_type:
+        indice_type = 'int64'
+    if '32' in feat_type:
+        feat_type = 'float32'
+    elif '64' in feat_type:
+        feat_type = 'float64'
     # placeholder for sparse matrix
     adj_indptr = te.placeholder((num_rows+1,), indice_type, 'adj_indptr')
     adj_indices = te.placeholder((nnz,), indice_type, 'adj_indices')
@@ -111,9 +119,9 @@ def spmm(binary_op, reduce_op, nnz, num_rows, num_cols,
         'spmm', binary_op, reduce_op, nnz, num_rows, 
         num_cols, out_len, indice_type, feat_type
         ])
-    if binary_op == 'copy_u':
+    if binary_op == 'copy_lhs':
         f_input.append(src_feat)
-    elif binary_op == 'copy_e':
+    elif binary_op == 'copy_rhs':
         f_input.append(dst_feat)
     else:
         f_input += [src_feat, dst_feat]
@@ -138,9 +146,13 @@ def spmm(binary_op, reduce_op, nnz, num_rows, num_cols,
         s[out].bind(edge_axis, te.thread_axis('blockIdx.x'))
     else:
         # llvm schedule
+        # pass
         s[out].reorder(edge_axis, reduce_axis, feat_axis)
         # s[out].parallel(edge_axis)
-        s[out].vectorize(feat_axis)
+        # s[out].pragma(edge_axis, 'parallel_launch_point')
+        # s[out].pragma(edge_axis, 'parallel_stride_pattern', 8)
+        # s[out].vectorize(feat_axis)
+    # print(tvm.lower(s, f_input))
     return tvm.build(s, f_input, target=target, name=f_name)
 
 def spmm_dds(binary_op, reduce_op, d1_size, d2_size, num_cols,
@@ -158,49 +170,73 @@ def spmm_dds(binary_op, reduce_op, d1_size, d2_size, num_cols,
     # placeholder for possible broadcasting offset
     lhs_off = te.placeholder((out_len,), indice_type, 'lhs_off')
     rhs_off = te.placeholder((out_len,), indice_type, 'rhs_off')
-    # feat partition
-    # if num_feat_partitions > 1:
-    feat_len_per_partition = out_len // num_feat_partitions
-    reshaped_src_feat = te.compute((num_feat_partitions, num_cols, feat_len_per_partition),
-                                    lambda fo, cid, fi: src_feat[cid, lhs_off[fo*feat_len_per_partition+fi] \
+    # compute
+    if num_feat_partitions > 1:
+        feat_len_per_partition = out_len // num_feat_partitions
+        reshaped_src_feat = te.compute((num_feat_partitions, num_cols, feat_len_per_partition),
+                                        lambda fo, cid, fi: src_feat[cid, lhs_off[fo*feat_len_per_partition+fi] \
                                         if use_bcast else fo*feat_len_per_partition+fi], name='reshaped_src_feat')
-    def msgfunc(fo, src_vertex_partition_idx, row, fi):
-        row_start = adj_s1_pos[src_vertex_partition_idx, row]
-        row_end = adj_s1_pos[src_vertex_partition_idx, row + 1]
-        row_num_elems = row_end - row_start
-        elem_idx = te.reduce_axis((0, row_num_elems), name="elem_idx")
-        adj_val = adj_vals[row_start + elem_idx, rhs_off[fo*feat_len_per_partition+fi] \
-                           if use_bcast else fo*feat_len_per_partition+fi]
-        feat_val = reshaped_src_feat[fo, adj_s1_idx[row_start + elem_idx], fi]
-        return te.sum(adj_val * feat_val, axis=elem_idx)
-    intermediate = te.compute((num_feat_partitions, d1_size, num_rows, feat_len_per_partition),
-                              msgfunc, name='intermediate')
-    k = te.reduce_axis((0, d1_size), name='src_vertex_partition_reduce')
-    reshaped_out = te.compute((num_feat_partitions, num_rows, feat_len_per_partition), 
-                               lambda fo, nn, fi: te.sum(intermediate[fo, k, nn, fi], axis=k),
-                               name='reshaped_out')
-    out = te.compute((num_rows, out_len), 
-                     lambda nn, ff: reshaped_out[ff // feat_len_per_partition, nn, ff % feat_len_per_partition], name='out')
+        def msgfunc(fo, src_vertex_partition_idx, row, fi):
+            row_start = adj_s1_pos[src_vertex_partition_idx, row]
+            row_end = adj_s1_pos[src_vertex_partition_idx, row + 1]
+            row_num_elems = row_end - row_start
+            elem_idx = te.reduce_axis((0, row_num_elems), name="elem_idx")
+            adj_val = adj_vals[row_start + elem_idx, rhs_off[fo*feat_len_per_partition+fi] \
+                            if use_bcast else fo*feat_len_per_partition+fi]
+            feat_val = reshaped_src_feat[fo, adj_s1_idx[row_start + elem_idx], fi]
+            return reduce_op_map[reduce_op](binary_op_map[binary_op](feat_val, adj_val), axis=elem_idx)
+        intermediate = te.compute((num_feat_partitions, d1_size, num_rows, feat_len_per_partition),
+                                msgfunc, name='intermediate')
+        k = te.reduce_axis((0, d1_size), name='src_vertex_partition_reduce')
+        reshaped_out = te.compute((num_feat_partitions, num_rows, feat_len_per_partition), 
+                                lambda fo, nn, fi: reduce_op_map[reduce_op](intermediate[fo, k, nn, fi], axis=k),
+                                name='reshaped_out')
+        out = te.compute((num_rows, out_len), 
+                        lambda nn, ff: reshaped_out[ff // feat_len_per_partition, nn, ff % feat_len_per_partition], name='out')
+    else:
+        def msgfunc(src_vertex_partition_idx, row, fid):
+            row_start = adj_s1_pos[src_vertex_partition_idx, row]
+            row_end = adj_s1_pos[src_vertex_partition_idx, row + 1]
+            row_num_elems = row_end - row_start
+            elem_idx = te.reduce_axis((0, row_num_elems), name="elem_idx")
+            adj_val = adj_vals[row_start + elem_idx, rhs_off[fid] if use_bcast else fid]
+            feat_val = src_feat[adj_s1_idx[row_start + elem_idx], fid]
+            return reduce_op_map[reduce_op](binary_op_map[binary_op](feat_val, adj_val), axis=elem_idx)
+        k = te.reduce_axis((0, d1_size), name='src_vertex_partition_reduce')
+        intermediate = te.compute((d1_size, num_rows, out_len), msgfunc, name='intermediate')
+        out = te.compute((num_rows, out_len), 
+            lambda nn, fid: reduce_op_map[reduce_op](intermediate[k, nn, fid], axis=k), name='out')
     # schedule
     s = te.create_schedule([out.op])
-    I, RO = intermediate, reshaped_out
-    s[I].reorder(I.op.axis[0], I.op.axis[1], I.op.axis[2], I.op.reduce_axis[0], I.op.axis[3])
-    s[RO].reorder(RO.op.axis[0], RO.op.reduce_axis[0], RO.op.axis[1], RO.op.axis[2])
-    s[I].compute_at(s[RO], RO.op.reduce_axis[0])
-    # Parallelize the rows of the sparse matrix
-    s[reshaped_src_feat].parallel(reshaped_src_feat.op.axis[1])
-    s[I].parallel(I.op.axis[2])
-    s[RO].parallel(RO.op.axis[1])
-    s[out].parallel(out.op.axis[0])
+    if num_feat_partitions > 1:
+        I, RO = intermediate, reshaped_out
+        s[I].reorder(I.op.axis[0], I.op.axis[1], I.op.axis[2], I.op.reduce_axis[0], I.op.axis[3])
+        s[RO].reorder(RO.op.axis[0], RO.op.reduce_axis[0], RO.op.axis[1], RO.op.axis[2])
+        s[I].compute_at(s[RO], RO.op.reduce_axis[0])
+        # Parallelize the rows of the sparse matrix
+        s[reshaped_src_feat].parallel(reshaped_src_feat.op.axis[1])
+        s[I].parallel(I.op.axis[2])
+        s[I].vectorize(I.op.axis[3])
+        s[RO].parallel(RO.op.axis[1])
+        s[out].parallel(out.op.axis[0])
+    else:
+        I = intermediate
+        s[I].reorder(I.op.axis[0], I.op.axis[1], I.op.reduce_axis[0], I.op.axis[2])
+        s[out].reorder(out.op.reduce_axis[0], out.op.axis[0], out.op.axis[1])
+        s[I].compute_at(s[out], out.op.reduce_axis[0])
+        s[I].parallel(I.op.axis[1])
+        s[I].vectorize(I.op.axis[2])
+        s[out].parallel(out.op.axis[0])
+
     # prepare input
     f_input = [adj_s1_pos, adj_s1_idx]
     f_name = '_'.join(str(x) for x in [
         'spmm', binary_op, reduce_op, nnz, num_rows, 
         num_cols, d1_size, 'partitioned', out_len, indice_type, feat_type
         ])
-    if binary_op == 'copy_u':
+    if binary_op == 'copy_lhs':
         f_input.append(src_feat)
-    elif binary_op == 'copy_e':
+    elif binary_op == 'copy_rhs':
         f_input.append(adj_vals)
     else:
         f_input += [src_feat, adj_vals]
@@ -208,7 +244,7 @@ def spmm_dds(binary_op, reduce_op, d1_size, d2_size, num_cols,
         f_input += [lhs_off, rhs_off]
         f_name += '_bcast'
     f_input.append(out)
-    print(tvm.lower(s, f_input))
+    # print(tvm.lower(s, f_input))
     return tvm.build(s, f_input, target=target, name=f_name)
     # else:
     #     def msgfunc(src_vertex_partition_idx, row, fid):
@@ -253,5 +289,5 @@ if __name__ == '__main__':
     indice_type = str(adj_scipy_csr.indices.dtype)
     feat_len = 64
     feat_type = 'float32'
-    f = spmm('copy_u', 'sum', nnz, num_rows, num_cols, feat_len, feat_len, feat_len, indice_type, feat_type, target=target)
+    f = spmm('copy_lhs', 'sum', nnz, num_rows, num_cols, feat_len, feat_len, feat_len, indice_type, feat_type, target=target)
     print(f.imported_modules[0].get_source())

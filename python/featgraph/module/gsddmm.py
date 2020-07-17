@@ -11,11 +11,11 @@ binary_op_map = {
     'sub': lambda x,y : x-y,
     'mul': lambda x,y : x*y,
     'div': lambda x,y : x/y,
-    'copy_u' : lambda x,y : x,
-    'copy_v' : lambda x,y : y,
+    'copy_lhs' : lambda x,y : x,
+    'copy_rhs' : lambda x,y : y,
 }
-binary_ops = ['add', 'sub', 'mul', 'div', 'copy_u', 'copy_v', 'dot']
-# binary_ops = ['add', 'sub', 'mul', 'div', 'copy_u', 'copy_v']
+binary_ops = ['add', 'sub', 'mul', 'div', 'copy_lhs', 'copy_rhs', 'dot']
+# binary_ops = ['add', 'sub', 'mul', 'div', 'copy_lhs', 'copy_rhs']
 indice_types = ['int32', 'int64']
 feature_types = ['float32', 'float64']
 
@@ -69,9 +69,9 @@ def gsddmm(binary_op, indice_type='int32', feature_type='float32', use_bcast=Fal
     # prepare input
     f_input = [adj_row_indices, adj_col_indices]
     f_name = 'sddmm_{}_{}_{}'.format(binary_op, indice_type, feature_type)
-    if binary_op == 'copy_u':
+    if binary_op == 'copy_lhs':
         f_input.append(src_feat)
-    elif binary_op == 'copy_v':
+    elif binary_op == 'copy_rhs':
         f_input.append(dst_feat)
     else:
         f_input += [src_feat, dst_feat]
@@ -102,26 +102,50 @@ def gsddmm(binary_op, indice_type='int32', feature_type='float32', use_bcast=Fal
     return tvm.lower(s, f_input, name=f_name)
 
 def sddmm(binary_op, nnz, num_rows, num_cols, 
-          lhs_len, rhs_len, out_len, 
-          indice_type, feat_type, reduce_size=1, 
+          lhs_len, rhs_len, out_len, indice_type, feat_type,
+           reduce_size=1, lhs_target=0, rhs_target=2,
           use_bcast=False, target='llvm'):
+    if '32' in indice_type:
+        indice_type = 'int32'
+    elif '64' in indice_type:
+        indice_type = 'int64'
+    if '32' in feat_type:
+        feat_type = 'float32'
+    elif '64' in feat_type:
+        feat_type = 'float64'
     # placeholder for sparse matrix
     adj_row_indices = te.placeholder((nnz,), indice_type, 'adj_row_indices')
     adj_col_indices = te.placeholder((nnz,), indice_type, 'adj_col_indices')
     # placeholder for dense features
-    src_feat = te.placeholder((num_rows, lhs_len), feat_type, 'src_feat')
-    dst_feat = te.placeholder((num_cols, rhs_len), feat_type, 'dst_feat')
+    def switch_target(t, l, name):
+        if t == 0:
+            return te.placeholder((num_rows, l), feat_type, name)
+        elif t == 1:
+            return te.placeholder((nnz, l), feat_type, name)
+        elif t == 2:
+            return te.placeholder((num_cols, l), feat_type, name)
+    lhs = switch_target(lhs_target, lhs_len, 'lhs')
+    rhs = switch_target(rhs_target, rhs_len, 'rhs')
     # placeholder for possible broadcasting offset
     lhs_off = te.placeholder((out_len,), indice_type, 'lhs_off')
     rhs_off = te.placeholder((out_len,), indice_type, 'rhs_off')
+    def idx_target(t, eid):
+        if t == 0:
+            return adj_row_indices[eid]
+        elif t == 1:
+            return eid
+        elif t == 2:
+            return adj_col_indices[eid]
     # compute
     if binary_op == 'dot':
         k = te.reduce_axis((0, reduce_size), name='k')
         out = te.compute(
             (nnz, out_len),
             lambda eid, fid: te.sum(
-                src_feat[adj_row_indices[eid], (lhs_off[fid] if use_bcast else fid) * reduce_size + k] * \
-                dst_feat[adj_col_indices[eid], (rhs_off[fid] if use_bcast else fid) * reduce_size + k],
+                lhs[idx_target(lhs_target, eid), \
+                    (lhs_off[fid] if use_bcast else fid) * reduce_size + k] * \
+                rhs[idx_target(rhs_target, eid), \
+                    (rhs_off[fid] if use_bcast else fid) * reduce_size + k],
                 axis=k
             ),
             name='out'
@@ -130,23 +154,27 @@ def sddmm(binary_op, nnz, num_rows, num_cols,
         out = te.compute(
             (nnz, out_len), 
             lambda eid, fid: binary_op_map[binary_op](
-                src_feat[adj_row_indices[eid], lhs_off[fid] if use_bcast else fid], \
-                dst_feat[adj_col_indices[eid], rhs_off[fid] if use_bcast else fid]
+                lhs[idx_target(lhs_target, eid), \
+                    lhs_off[fid] if use_bcast else fid], \
+                rhs[idx_target(rhs_target, eid), \
+                    rhs_off[fid] if use_bcast else fid]
             ),
             name='out'
         )
     # prepare input
-    f_input = [adj_row_indices, adj_col_indices]
+    f_input = []
+    if lhs_target == 0 or rhs_target == 0:
+        f_input.append(adj_row_indices)
+    if lhs_target == 2 or rhs_target == 2:
+        f_input.append(adj_col_indices)
     f_name = '_'.join(str(x) for x in [
         'sddmm', binary_op, nnz, num_rows, num_cols,
          lhs_len, rhs_len, out_len, indice_type, feat_type
          ])
-    if binary_op == 'copy_u':
-        f_input.append(src_feat)
-    elif binary_op == 'copy_v':
-        f_input.append(dst_feat)
-    else:
-        f_input += [src_feat, dst_feat]
+    if binary_op != 'copy_rhs':
+        f_input.append(lhs)
+    if binary_op != 'copy_lhs':
+        f_input.append(rhs)
     if use_bcast:
         f_input += [lhs_off, rhs_off]
         f_name += '_bcast'
@@ -179,11 +207,13 @@ def sddmm(binary_op, nnz, num_rows, num_cols,
             s[out].bind(eo, te.thread_axis('blockIdx.x'))
     elif target == 'llvm':
         pass
+        # TODO only parallel, i.e. without vectorize on feat_axis, will segfault, why?
         # s[out].parallel(edge_axis)
         # s[out].pragma(edge_axis, 'parallel_launch_point')
         # s[out].pragma(edge_axis, 'parallel_stride_pattern', 8)
-        # s[out].vectorize(feat_axis)
-        # print(tvm.lower(s, f_input))
+        # if binary_op != 'dot':
+        #     s[out].vectorize(feat_axis)
+    # print(tvm.lower(s, f_input))
     return tvm.build(s, f_input, target=target, name=f_name)
 
 def build_all(target, dir = None):
