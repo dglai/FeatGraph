@@ -14,11 +14,43 @@ binary_op_map = {
     'copy_lhs' : lambda x,y : x,
     'copy_rhs' : lambda x,y : y,
 }
-reduce_op_map = {
-    'sum' : te.sum,
-    'max' : te.max,
-    'min' : te.min
-}
+def max_combine(x, y):
+    if len(x) == 3:
+        eid = tvm.tir.Select(x[2] > y[2], x[0], y[0])
+        cid = tvm.tir.Select(x[2] > y[2], x[1], y[1])
+        val = tvm.tir.Select(x[2] > y[2], x[2], y[2])
+        return eid, cid, val
+    else:
+        idx = tvm.tir.Select(x[1] > y[1], x[0], y[0])
+        val = tvm.tir.Select(x[1] > y[1], x[1], y[1])
+        return idx, val
+
+def max_identity(t0, t1, t2=None):
+    if t2:
+        return tvm.tir.const(-1, t0), tvm.tir.const(-1, t1), tvm.te.min_value(t2)
+    else:
+        return tvm.tir.const(-1, t0), tvm.te.min_value(t1)
+
+def min_combine(x, y):
+    if len(x) == 3:
+        eid = tvm.tir.Select(x[2] < y[2], x[0], y[0])
+        cid = tvm.tir.Select(x[2] < y[2], x[1], y[1])
+        val = tvm.tir.Select(x[2] < y[2], x[2], y[2])
+        return eid, cid, val
+    else:
+        idx = tvm.tir.Select(x[1] < y[1], x[0], y[0])
+        val = tvm.tir.Select(x[1] < y[1], x[1], y[1])
+        return idx, val
+
+def min_identity(t0, t1, t2=None):
+    if t2:
+        return tvm.tir.const(-1, t0), tvm.tir.const(-1, t1), tvm.te.max_value(t2)
+    else:
+        return tvm.tir.const(-1, t0), tvm.te.max_value(t1)
+
+argmax = te.comm_reducer(max_combine, max_identity, name='argmax')
+argmin = te.comm_reducer(min_combine, min_identity, name='argmin')
+
 binary_ops = ['add', 'sub', 'mul', 'div', 'copy_lhs', 'copy_rhs']
 reduce_ops = ['sum', 'max', 'min']
 indice_types = ['int32', 'int64']
@@ -104,6 +136,8 @@ def spmm(binary_op, reduce_op, nnz, num_rows, num_cols,
     lhs_off = te.placeholder((out_len,), indice_type, 'lhs_off')
     rhs_off = te.placeholder((out_len,), indice_type, 'rhs_off')
     # compute
+    use_u = binary_op != 'copy_rhs'
+    use_e = binary_op != 'copy_lhs'
     def msgfunc(row, fid):
         row_start = adj_indptr[row]
         row_end = adj_indptr[row + 1]
@@ -111,28 +145,61 @@ def spmm(binary_op, reduce_op, nnz, num_rows, num_cols,
         elem_idx = te.reduce_axis((0, row_num_elems), name="elem_idx")
         adj_val = dst_feat[row_start + elem_idx, rhs_off[fid] if use_bcast else fid]
         feat_val = src_feat[adj_indices[row_start + elem_idx], lhs_off[fid] if use_bcast else fid]
-        return reduce_op_map[reduce_op](binary_op_map[binary_op](feat_val, adj_val), axis=elem_idx)
-    out = te.compute((num_rows, out_len), msgfunc, name='out')
+        if reduce_op == 'sum':
+            return te.sum(binary_op_map[binary_op](feat_val, adj_val), axis=elem_idx)
+        elif reduce_op == 'max':
+            if binary_op == 'copy_lhs':
+                return argmax((adj_indices[row_start + elem_idx], feat_val), axis=elem_idx)
+            elif binary_op == 'copy_rhs':
+                return argmax((row_start+elem_idx, adj_val), axis=elem_idx)
+            else:
+                return argmax((row_start+elem_idx, adj_indices[row_start + elem_idx], \
+                    binary_op_map[binary_op](feat_val, adj_val)), axis=elem_idx)
+        elif reduce_op == 'min':
+            if binary_op == 'copy_lhs':
+                return argmin((adj_indices[row_start + elem_idx], feat_val), axis=elem_idx)
+            elif binary_op == 'copy_rhs':
+                return argmin((row_start+elem_idx, adj_val), axis=elem_idx)
+            else:
+                return argmin((row_start+elem_idx, adj_indices[row_start + elem_idx], \
+                    binary_op_map[binary_op](feat_val, adj_val)), axis=elem_idx)
+        else:
+            raise NotImplementedError
+    if reduce_op == 'sum':
+        out = te.compute((num_rows, out_len), msgfunc, name='out')
+    else:
+        if binary_op == 'copy_lhs':
+            argu, out = te.compute((num_rows, out_len), msgfunc, name='out')
+        elif binary_op == 'copy_rhs':
+            arge, out = te.compute((num_rows, out_len), msgfunc, name='out')
+        else:
+            arge, argu, out = te.compute((num_rows, out_len), msgfunc, name='out')
     # prepare input
     f_input = [adj_indptr, adj_indices]
     f_name = '_'.join(str(x) for x in [
         'spmm', binary_op, reduce_op, nnz, num_rows, 
         num_cols, out_len, indice_type, feat_type
         ])
-    if binary_op == 'copy_lhs':
+    ops = [out.op]
+    if use_u:
         f_input.append(src_feat)
-    elif binary_op == 'copy_rhs':
+    if use_e:
         f_input.append(dst_feat)
-    else:
-        f_input += [src_feat, dst_feat]
     if use_bcast:
         f_input += [lhs_off, rhs_off]
         f_name += '_bcast'
+    if reduce_op != 'sum':
+        if use_u:
+            f_input.append(argu)
+            ops.append(argu.op)
+        if use_e:
+            f_input.append(arge)
+            ops.append(arge.op)
     f_input.append(out)
     # schedule
-    s = te.create_schedule(out.op)
     edge_axis, feat_axis = out.op.axis
-    reduce_axis = out.op.reduce_axis[0]
+    reduce_axis = out.op.reduce_axis[0]    
+    s = te.create_schedule(ops)
     if target == 'cuda':
         # cuda schedule
         if out_len < 16:
@@ -148,10 +215,10 @@ def spmm(binary_op, reduce_op, nnz, num_rows, num_cols,
         # llvm schedule
         # pass
         s[out].reorder(edge_axis, reduce_axis, feat_axis)
-        # s[out].parallel(edge_axis)
-        # s[out].pragma(edge_axis, 'parallel_launch_point')
-        # s[out].pragma(edge_axis, 'parallel_stride_pattern', 8)
-        # s[out].vectorize(feat_axis)
+        s[out].parallel(edge_axis)
+        s[out].pragma(edge_axis, 'parallel_launch_point')
+        s[out].pragma(edge_axis, 'parallel_stride_pattern', 8)
+        s[out].vectorize(feat_axis)
     # print(tvm.lower(s, f_input))
     return tvm.build(s, f_input, target=target, name=f_name)
 
@@ -289,5 +356,5 @@ if __name__ == '__main__':
     indice_type = str(adj_scipy_csr.indices.dtype)
     feat_len = 64
     feat_type = 'float32'
-    f = spmm('copy_lhs', 'sum', nnz, num_rows, num_cols, feat_len, feat_len, feat_len, indice_type, feat_type, target=target)
+    f = spmm('copy_rhs', 'max', nnz, num_rows, num_cols, feat_len, feat_len, feat_len, indice_type, feat_type, target=target)
     print(f.imported_modules[0].get_source())
