@@ -194,10 +194,10 @@ def sddmm(binary_op, nnz, num_rows, num_cols,
             if nby > 65535:
                 eo, e = s[out].split(eo, nparts = 65535)
                 s[out].reorder(eo, e, ei, fo, fi)
-                s[out].bind(fi, te.thread_axis('threadIdx.x'))
-                s[out].bind(fo, te.thread_axis('blockIdx.x'))
-                s[out].bind(ei, te.thread_axis('threadIdx.y'))
-                s[out].bind(eo, te.thread_axis('blockIdx.y'))
+            s[out].bind(fi, te.thread_axis('threadIdx.x'))
+            s[out].bind(fo, te.thread_axis('blockIdx.x'))
+            s[out].bind(ei, te.thread_axis('threadIdx.y'))
+            s[out].bind(eo, te.thread_axis('blockIdx.y'))
         else:
             # if dot product, use tree reduction
             reduce_axis = out.op.reduce_axis[0]

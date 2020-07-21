@@ -218,8 +218,8 @@ def spmm(binary_op, reduce_op, nnz, num_rows, num_cols,
         s[out].parallel(edge_axis)
         s[out].pragma(edge_axis, 'parallel_launch_point')
         s[out].pragma(edge_axis, 'parallel_stride_pattern', 8)
-        s[out].vectorize(feat_axis)
-    # print(tvm.lower(s, f_input))
+        # make compiling really slow when shape is not good
+        # s[out].vectorize(feat_axis)
     return tvm.build(s, f_input, target=target, name=f_name)
 
 def spmm_dds(binary_op, reduce_op, d1_size, d2_size, num_cols,
@@ -341,20 +341,16 @@ def build_all(target, dir = None):
 
 
 if __name__ == '__main__':
-    import scipy, logging
-    target = 'cuda'
-    # f = build_all(target)
-    # ir = gspmm('add', 'sum', indice_type='int32', feature_type='float32', target=target, use_bcast=False)
-    # print(ir)
-    # f = tvm.build(ir, target=target)
-    # print(f.imported_modules[0].get_source())
-    adj_scipy_csr = scipy.sparse.random(2**10, 2**10, density=0.1, format='csr').astype('int32')
-    # evaluate_time()
-    nnz = adj_scipy_csr.indices.shape[0]
-    num_rows = adj_scipy_csr.shape[0]
-    num_cols = adj_scipy_csr.shape[1]
-    indice_type = str(adj_scipy_csr.indices.dtype)
-    feat_len = 64
+    # import dgl
+    target = 'llvm'
+    # g = dgl.rand_graph(100,30)
+    lhs_len, rhs_len = 105, 21
+    out_len = int(15 * 49)
+    use_bcast = True
+    nnz = 3000
+    num_rows = 80
+    num_cols = 160
+    indice_type = 'int32'
     feat_type = 'float32'
-    f = spmm('copy_rhs', 'max', nnz, num_rows, num_cols, feat_len, feat_len, feat_len, indice_type, feat_type, target=target)
-    print(f.imported_modules[0].get_source())
+    f = spmm('add', 'sum', nnz, num_rows, num_cols, lhs_len, rhs_len, out_len, indice_type, feat_type, use_bcast=use_bcast, target=target)
+    # print(f.imported_modules[0].get_source())
