@@ -27,9 +27,9 @@ def max_combine(x, y):
 
 def max_identity(t0, t1, t2=None):
     if t2:
-        return tvm.tir.const(-1, t0), tvm.tir.const(-1, t1), tvm.te.min_value(t2)
+        return tvm.tir.const(0, t0), tvm.tir.const(0, t1), tvm.te.min_value(t2)
     else:
-        return tvm.tir.const(-1, t0), tvm.te.min_value(t1)
+        return tvm.tir.const(0, t0), tvm.te.min_value(t1)
 
 def min_combine(x, y):
     if len(x) == 3:
@@ -44,9 +44,9 @@ def min_combine(x, y):
 
 def min_identity(t0, t1, t2=None):
     if t2:
-        return tvm.tir.const(-1, t0), tvm.tir.const(-1, t1), tvm.te.max_value(t2)
+        return tvm.tir.const(0, t0), tvm.tir.const(0, t1), tvm.te.max_value(t2)
     else:
-        return tvm.tir.const(-1, t0), tvm.te.max_value(t1)
+        return tvm.tir.const(0, t0), tvm.te.max_value(t1)
 
 argmax = te.comm_reducer(max_combine, max_identity, name='argmax')
 argmin = te.comm_reducer(min_combine, min_identity, name='argmin')
@@ -117,7 +117,7 @@ def gspmm(binary_op, reduce_op, indice_type='int32', feature_type='float32', use
 
 def spmm(binary_op, reduce_op, nnz, num_rows, num_cols, 
          lhs_len, rhs_len, out_len,
-         indice_type, feat_type, use_bcast=False, target='llvm'):
+         indice_type, feat_type, use_bcast=False, use_idx=False, target='llvm'):
     if '32' in indice_type:
         indice_type = 'int32'
     elif '64' in indice_type:
@@ -130,6 +130,7 @@ def spmm(binary_op, reduce_op, nnz, num_rows, num_cols,
     adj_indptr = te.placeholder((num_rows+1,), indice_type, 'adj_indptr')
     adj_indices = te.placeholder((nnz,), indice_type, 'adj_indices')
     dst_feat = te.placeholder((nnz, rhs_len), feat_type, 'dst_feat')
+    edge_mapping = te.placeholder((nnz,), indice_type, 'edge_mapping')
     # placeholder for dense features
     src_feat = te.placeholder((num_cols, lhs_len), feat_type, 'src_feat')
     # placeholder for possible broadcasting offset
@@ -143,7 +144,8 @@ def spmm(binary_op, reduce_op, nnz, num_rows, num_cols,
         row_end = adj_indptr[row + 1]
         row_num_elems = row_end - row_start
         elem_idx = te.reduce_axis((0, row_num_elems), name="elem_idx")
-        adj_val = dst_feat[row_start + elem_idx, rhs_off[fid] if use_bcast else fid]
+        adj_val = dst_feat[edge_mapping[row_start+elem_idx] if use_idx else row_start + elem_idx, \
+            rhs_off[fid] if use_bcast else fid]
         feat_val = src_feat[adj_indices[row_start + elem_idx], lhs_off[fid] if use_bcast else fid]
         if reduce_op == 'sum':
             return te.sum(binary_op_map[binary_op](feat_val, adj_val), axis=elem_idx)
@@ -151,17 +153,21 @@ def spmm(binary_op, reduce_op, nnz, num_rows, num_cols,
             if binary_op == 'copy_lhs':
                 return argmax((adj_indices[row_start + elem_idx], feat_val), axis=elem_idx)
             elif binary_op == 'copy_rhs':
-                return argmax((row_start+elem_idx, adj_val), axis=elem_idx)
+                return argmax((edge_mapping[row_start+elem_idx] if use_idx else row_start+elem_idx, \
+                    adj_val), axis=elem_idx)
             else:
-                return argmax((row_start+elem_idx, adj_indices[row_start + elem_idx], \
+                return argmax((edge_mapping[row_start+elem_idx] if use_idx else row_start+elem_idx, \
+                    adj_indices[row_start + elem_idx], \
                     binary_op_map[binary_op](feat_val, adj_val)), axis=elem_idx)
         elif reduce_op == 'min':
             if binary_op == 'copy_lhs':
                 return argmin((adj_indices[row_start + elem_idx], feat_val), axis=elem_idx)
             elif binary_op == 'copy_rhs':
-                return argmin((row_start+elem_idx, adj_val), axis=elem_idx)
+                return argmin((edge_mapping[row_start+elem_idx] if use_idx else row_start+elem_idx, \
+                    adj_val), axis=elem_idx)
             else:
-                return argmin((row_start+elem_idx, adj_indices[row_start + elem_idx], \
+                return argmin((edge_mapping[row_start+elem_idx] if use_idx else row_start+elem_idx, \
+                    adj_indices[row_start + elem_idx], \
                     binary_op_map[binary_op](feat_val, adj_val)), axis=elem_idx)
         else:
             raise NotImplementedError
@@ -195,6 +201,9 @@ def spmm(binary_op, reduce_op, nnz, num_rows, num_cols,
         if use_e:
             f_input.append(arge)
             ops.append(arge.op)
+    if use_idx:
+        f_input.append(edge_mapping)
+        f_name += '_idx'
     f_input.append(out)
     # schedule
     edge_axis, feat_axis = out.op.axis
@@ -294,7 +303,6 @@ def spmm_dds(binary_op, reduce_op, d1_size, d2_size, num_cols,
         s[I].parallel(I.op.axis[1])
         s[I].vectorize(I.op.axis[2])
         s[out].parallel(out.op.axis[0])
-
     # prepare input
     f_input = [adj_s1_pos, adj_s1_idx]
     f_name = '_'.join(str(x) for x in [
@@ -313,16 +321,6 @@ def spmm_dds(binary_op, reduce_op, d1_size, d2_size, num_cols,
     f_input.append(out)
     # print(tvm.lower(s, f_input))
     return tvm.build(s, f_input, target=target, name=f_name)
-    # else:
-    #     def msgfunc(src_vertex_partition_idx, row, fid):
-    #         row_start = adj_s1_pos[src_vertex_partition_idx * d2_size + row]
-    #         row_end = adj_s1_pos[src_vertex_partition_idx * d2_size + row + 1]
-    #         row_num_elems = row_end - row_start
-    #         elem_idx = te.reduce_axis((0, row_num_elems), name="elem_idx")
-    #         adj_val = adj_vals[row_start + elem_idx]
-    #         feat_val = src_feat[adj_s1_idx[row_start + elem_idx], fid]
-    #         return te.sum(adj_val * feat_val, axis=elem_idx)
-
 
 def build_all(target, dir = None):
     # build a .so library packing all kinds of kernel for a target(cuda/llvm)

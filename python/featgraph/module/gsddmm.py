@@ -1,7 +1,6 @@
 import tvm
 from tvm import te
 from tvm import autotvm
-import logging
 import numpy as np
 
 from featgraph.util import calc_bcast
@@ -184,7 +183,14 @@ def sddmm(binary_op, nnz, num_rows, num_cols,
     edge_axis, feat_axis = out.op.axis
     if target == 'cuda':
         # cuda schedule
-        if binary_op != 'dot':
+        if binary_op == 'dot' and reduce_size >= 32:
+            # if dot product, use tree reduction
+            reduce_axis = out.op.reduce_axis[0]
+            eo, ei = s[out].split(edge_axis, factor = (1024 // out_len))
+            s[out].bind(reduce_axis, te.thread_axis('threadIdx.x'))
+            s[out].bind(ei, te.thread_axis('threadIdx.y'))
+            s[out].bind(eo, te.thread_axis('blockIdx.x'))
+        else:
             ntx = tvm.autotvm.task.space.get_pow2s(out_len)[-1]
             ntx = 1024 if ntx > 1024 else ntx
             nty = 1024 // ntx
@@ -198,13 +204,6 @@ def sddmm(binary_op, nnz, num_rows, num_cols,
             s[out].bind(fo, te.thread_axis('blockIdx.x'))
             s[out].bind(ei, te.thread_axis('threadIdx.y'))
             s[out].bind(eo, te.thread_axis('blockIdx.y'))
-        else:
-            # if dot product, use tree reduction
-            reduce_axis = out.op.reduce_axis[0]
-            eo, ei = s[out].split(edge_axis, factor = (1024 // out_len))
-            s[out].bind(reduce_axis, te.thread_axis('threadIdx.x'))
-            s[out].bind(ei, te.thread_axis('threadIdx.y'))
-            s[out].bind(eo, te.thread_axis('blockIdx.x'))
     elif target == 'llvm':
         pass
         # TODO only parallel, i.e. without vectorize on feat_axis, will segfault, why?
@@ -239,31 +238,21 @@ def build_all(target, dir = None):
 #     return sddmm
 
 if __name__ == '__main__':
-    import scipy, logging, sys
     target = 'cuda'
-    # f = build_all(target)
-    # ir = gsddmm('add', indice_type='int32', feature_type='float32', target=target, use_bcast=False)
-    # print(ir)
-    # f = tvm.build(ir, target=target)
-    # print(f.imported_modules[0].get_source())
-    # adj_scipy_coo = scipy.sparse.random(2**12, 2**12, density=0.1, format='coo').astype('int32')
-    # evaluate_time()
-    # nnz = adj_scipy_coo.row.shape[0]
-    # num_rows = adj_scipy_coo.shape[0]
-    # num_cols = adj_scipy_coo.shape[1]
-    # indice_type = str(adj_scipy_coo.row.dtype)
-    # feat_len = 64
-    # feat_type = 'float32'
-    # f = sddmm('dot', nnz, num_rows, num_cols, feat_len, feat_len, feat_len,
-    #           indice_type, feat_type, reduce_size=16, target=target)
-    # print(f.imported_modules[0].get_source())
-    # src_feat = np.random.random((num_rows, feat_len)).astype('float32')
-    # dst_feat = np.random.random((num_cols, feat_len)).astype('float32')
-    # out = np.zeros((nnz, feat_len)).astype('float32')
-    # f_input = [adj_scipy_coo.row, adj_scipy_coo.col, src_feat, dst_feat, out]
-    # ctx = tvm.cpu(0) if target == 'llvm' else tvm.gpu(0)
-    # f_input = [tvm.nd.array(x, ctx=ctx) for x in f_input]
-    # f(*f_input)
+    # import dgl
+    target = 'cuda'
+    # g = dgl.rand_graph(100,30)
+    lhs_len, rhs_len = 3, 3
+    out_len = 1
+    use_bcast = False
+    nnz = 30
+    num_rows = 100
+    num_cols = 100
+    indice_type = 'int32'
+    feat_type = 'float32'
+    f = sddmm('dot', nnz, num_rows, num_cols, lhs_len, rhs_len, out_len, indice_type, feat_type,\
+         reduce_size=3, lhs_target=0, rhs_target=0, use_bcast=use_bcast, target=target)
+    print(f.imported_modules[0].get_source())
 
 
 
