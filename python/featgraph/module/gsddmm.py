@@ -13,14 +13,112 @@ binary_op_map = {
     'copy_lhs' : lambda x,y : x,
     'copy_rhs' : lambda x,y : y,
 }
-binary_ops = ['add', 'sub', 'mul', 'div', 'copy_lhs', 'copy_rhs', 'dot']
-indice_types = ['int32', 'int64']
-feature_types = ['float32', 'float64']
+
+def _sddmm_compute(out_shp, binary_op, lhs, rhs, 
+                  lhs_idx, rhs_idx, feat_bcast, 
+                  reduce_size=1, num_feat_partitions=1):
+    if binary_op == 'dot':
+        k = te.reduce_axis((0, reduce_size), name='k')
+        out = te.compute(
+            out_shp,
+            lambda eid, fid: te.sum(
+                lhs[lhs_idx(eid), feat_bcast(fid, True) * reduce_size + k] * \
+                rhs[rhs_idx(eid), feat_bcast(fid, False) * reduce_size + k],
+                axis=k
+            ),
+            name='out'
+        )
+    else:
+        out = te.compute(
+            out_shp, 
+            lambda eid, fid: binary_op_map[binary_op](
+                lhs[lhs_idx(eid), feat_bcast(fid, True)], \
+                rhs[rhs_idx(eid), feat_bcast(fid, False)]
+            ),
+            name='out'
+        )
+    return out
+
+def _sddmm_compute_feat_partition(out_shp, binary_op, lhs, rhs, 
+                                  lhs_idx, rhs_idx, feat_bcast, 
+                                  reduce_size=1, num_feat_partitions=1):
+    # assume out_len is a multiply of num_feat_partitions
+    feat_len_per_partition = out_shp[1] // num_feat_partitions
+    reshaped_lhs = te.compute((num_feat_partitions, lhs.shape[0], feat_len_per_partition * reduce_size), \
+                               lambda fo, idx, fi: lhs[idx, feat_bcast(fo*feat_len_per_partition+(fi // reduce_size), True) \
+                                                       * reduce_size + (fi % reduce_size)], name='reshaped_lhs')
+    reshaped_rhs = te.compute((num_feat_partitions, rhs.shape[0], feat_len_per_partition * reduce_size), \
+                               lambda fo, idx, fi: rhs[idx, feat_bcast(fo*feat_len_per_partition+(fi // reduce_size), False) \
+                                                       * reduce_size + (fi % reduce_size)], name='reshaped_rhs')
+    if binary_op == 'dot':
+        k = te.reduce_axis((0, reduce_size), name='k')
+        out = te.compute(
+            out_shp,
+            lambda eid, fid: te.sum(
+                reshaped_lhs[fid // feat_len_per_partition, \
+                             lhs_idx(eid), (fid % feat_len_per_partition) * reduce_size + k] * \
+                reshaped_rhs[fid // feat_len_per_partition, \
+                             rhs_idx(eid), (fid % feat_len_per_partition) * reduce_size + k],
+                axis=k
+            ),
+            name='out'
+        )
+    else:
+        out = te.compute(
+            out_shp, 
+            lambda eid, fid: binary_op_map[binary_op](
+                reshaped_lhs[fid // feat_len_per_partition, \
+                             lhs_idx(eid), fid % feat_len_per_partition], \
+                reshaped_rhs[fid // feat_len_per_partition, \
+                             rhs_idx(eid), fid % feat_len_per_partition]
+            ),
+            name='out'
+        )
+    return out
+
+def _sddmm_cuda_general(s, out):
+    out_len = out.shape[1]
+    edge_axis, feat_axis = out.op.axis
+    nnz = out.shape[0]
+    ntx = tvm.autotvm.task.space.get_pow2s(out_len)[-1]
+    ntx = 1024 if ntx > 1024 else ntx
+    nty = 1024 // ntx
+    fo, fi = s[out].split(feat_axis, factor=ntx)
+    eo, ei = s[out].split(edge_axis, factor=nty)
+    nby = (nnz + nty - 1) // nty
+    if nby > 65535:
+        eo, e = s[out].split(eo, nparts = 65535)
+        s[out].reorder(eo, e, ei, fo, fi)
+    s[out].bind(fi, te.thread_axis('threadIdx.x'))
+    s[out].bind(fo, te.thread_axis('blockIdx.x'))
+    s[out].bind(ei, te.thread_axis('threadIdx.y'))
+    s[out].bind(eo, te.thread_axis('blockIdx.y'))
+
+def _sddmm_cuda_tree_reduce(s, out):
+    edge_axis = out.op.axis[0]
+    reduce_axis = out.op.reduce_axis[0]
+    # eo, ei = s[out].split(edge_axis, factor = (1024 // reduce_size))
+    # s[out].bind(reduce_axis, te.thread_axis('threadIdx.x'))
+    ro, ri = s[out].split(reduce_axis, factor = 32)
+    eo, ei = s[out].split(edge_axis, factor = 32)
+    s[out].bind(ri, te.thread_axis('threadIdx.x'))
+    s[out].bind(ei, te.thread_axis('threadIdx.y'))
+    s[out].bind(eo, te.thread_axis('blockIdx.x'))
+
+def _sddmm_cpu_general(s, out):
+    edge_axis = out.op.axis[0]
+    s[out].parallel(edge_axis)
+    s[out].pragma(edge_axis, 'parallel_launch_point')
+    s[out].pragma(edge_axis, 'parallel_stride_pattern', 8)
+    
+def _sddmm_cpu_feat_partition(s, out, num_feat_paritions):
+    pass
+
 
 def sddmm(binary_op, nnz, num_rows, num_cols, 
           lhs_len, rhs_len, out_len, indice_type, feat_type,
            reduce_size=1, lhs_target=0, rhs_target=2,
-          use_bcast=False, target='llvm'):
+          use_bcast=False, target='llvm', num_feat_partitions=1):
     if '32' in indice_type:
         indice_type = 'int32'
     elif '64' in indice_type:
@@ -49,38 +147,31 @@ def sddmm(binary_op, nnz, num_rows, num_cols,
     # placeholder for possible broadcasting offset
     lhs_off = te.placeholder((out_len,), indice_type, 'lhs_off')
     rhs_off = te.placeholder((out_len,), indice_type, 'rhs_off')
-    def idx_target(t, eid):
-        if t == 0:
-            return adj_row_indices[eid]
-        elif t == 1:
-            return eid
-        elif t == 2:
-            return adj_col_indices[eid]
+    def idx_target(t):
+        def foo(eid):
+            if t == 0:
+                return adj_row_indices[eid]
+            elif t == 1:
+                return eid
+            elif t == 2:
+                return adj_col_indices[eid]
+        return foo
+    def feat_bcast(fid, left):
+        if not use_bcast:
+            return fid
+        elif left:
+            return lhs_off[fid]
+        else:
+            return rhs_off[fid]
     # compute
-    if binary_op == 'dot':
-        k = te.reduce_axis((0, reduce_size), name='k')
-        out = te.compute(
-            (nnz, out_len),
-            lambda eid, fid: te.sum(
-                lhs[idx_target(lhs_target, eid), \
-                    (lhs_off[fid] if use_bcast else fid) * reduce_size + k] * \
-                rhs[idx_target(rhs_target, eid), \
-                    (rhs_off[fid] if use_bcast else fid) * reduce_size + k],
-                axis=k
-            ),
-            name='out'
-        )
+    if num_feat_partitions == 1:
+        out = _sddmm_compute((nnz, out_len), binary_op, lhs, rhs, \
+                        idx_target(lhs_target), idx_target(rhs_target), feat_bcast, \
+                        reduce_size)
     else:
-        out = te.compute(
-            (nnz, out_len), 
-            lambda eid, fid: binary_op_map[binary_op](
-                lhs[idx_target(lhs_target, eid), \
-                    lhs_off[fid] if use_bcast else fid], \
-                rhs[idx_target(rhs_target, eid), \
-                    rhs_off[fid] if use_bcast else fid]
-            ),
-            name='out'
-        )
+        out = _sddmm_compute_feat_partition((nnz, out_len), binary_op, lhs, rhs, \
+                        idx_target(lhs_target), idx_target(rhs_target), feat_bcast, \
+                        reduce_size, num_feat_partitions)
     # prepare input
     f_input = []
     if lhs_target == 0 or rhs_target == 0:
@@ -101,60 +192,34 @@ def sddmm(binary_op, nnz, num_rows, num_cols,
     f_input.append(out)
     # schedule
     s = te.create_schedule(out.op)
-    edge_axis, feat_axis = out.op.axis
     if target == 'cuda':
         # cuda schedule
         if binary_op == 'dot' and reduce_size >= 32:
             # if dot product, use tree reduction
-            reduce_axis = out.op.reduce_axis[0]
-            # eo, ei = s[out].split(edge_axis, factor = (1024 // reduce_size))
-            # s[out].bind(reduce_axis, te.thread_axis('threadIdx.x'))
-            ro, ri = s[out].split(reduce_axis, factor = 32)
-            eo, ei = s[out].split(edge_axis, factor = 32)
-            s[out].bind(ri, te.thread_axis('threadIdx.x'))
-            s[out].bind(ei, te.thread_axis('threadIdx.y'))
-            s[out].bind(eo, te.thread_axis('blockIdx.x'))
+            _sddmm_cuda_tree_reduce(s, out)
         else:
-            ntx = tvm.autotvm.task.space.get_pow2s(out_len)[-1]
-            ntx = 1024 if ntx > 1024 else ntx
-            nty = 1024 // ntx
-            fo, fi = s[out].split(feat_axis, factor=ntx)
-            eo, ei = s[out].split(edge_axis, factor=nty)
-            nby = (nnz + nty - 1) // nty
-            if nby > 65535:
-                eo, e = s[out].split(eo, nparts = 65535)
-                s[out].reorder(eo, e, ei, fo, fi)
-            s[out].bind(fi, te.thread_axis('threadIdx.x'))
-            s[out].bind(fo, te.thread_axis('blockIdx.x'))
-            s[out].bind(ei, te.thread_axis('threadIdx.y'))
-            s[out].bind(eo, te.thread_axis('blockIdx.y'))
+            _sddmm_cuda_general(s, out)
     elif target == 'llvm':
-        pass
-        # TODO only parallel, i.e. without vectorize on feat_axis, will segfault, why?
-        # s[out].parallel(edge_axis)
-        # s[out].pragma(edge_axis, 'parallel_launch_point')
-        # s[out].pragma(edge_axis, 'parallel_stride_pattern', 8)
-        # if binary_op != 'dot':
-        #     s[out].vectorize(feat_axis)
-    # print(tvm.lower(s, f_input))
+        if num_feat_partitions == 1:
+            _sddmm_cpu_general(s, out)
+        else:
+            _sddmm_cpu_feat_partition(s, out, num_feat_partitions)
+    print(tvm.lower(s, f_input))
     return tvm.build(s, f_input, target=target, name=f_name)
 
 if __name__ == '__main__':
-    target = 'cuda'
-    # import dgl
-    target = 'cuda'
-    # g = dgl.rand_graph(100,30)
-    lhs_len, rhs_len = 3, 3
-    out_len = 1
-    use_bcast = False
-    nnz = 30
-    num_rows = 100
-    num_cols = 100
+    target = 'llvm'
+    lhs_len, rhs_len = 8, 16
+    out_len = 2
+    use_bcast = True
+    nnz = 5
+    num_rows = 10
+    num_cols = 10
     indice_type = 'int32'
     feat_type = 'float32'
     f = sddmm('dot', nnz, num_rows, num_cols, lhs_len, rhs_len, out_len, indice_type, feat_type,\
-         reduce_size=3, lhs_target=0, rhs_target=0, use_bcast=use_bcast, target=target)
-    print(f.imported_modules[0].get_source())
+         reduce_size=8, lhs_target=0, rhs_target=2, use_bcast=use_bcast, target=target, num_feat_partitions=2)
+    # print(f.imported_modules[0].get_source())
 
 
 
