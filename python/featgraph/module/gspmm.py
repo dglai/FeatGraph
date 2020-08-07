@@ -1,8 +1,6 @@
 import tvm
 from tvm import te
-from tvm import autotvm
-import logging
-import numpy as np
+from tvm import topi
 
 from featgraph.util import calc_bcast
 
@@ -14,6 +12,7 @@ binary_op_map = {
     'copy_lhs' : lambda x,y : x,
     'copy_rhs' : lambda x,y : y,
 }
+
 def max_combine(x, y):
     if len(x) == 3:
         eid = tvm.tir.Select(x[2] > y[2], x[0], y[0])
@@ -51,14 +50,173 @@ def min_identity(t0, t1, t2=None):
 argmax = te.comm_reducer(max_combine, max_identity, name='argmax')
 argmin = te.comm_reducer(min_combine, min_identity, name='argmin')
 
-binary_ops = ['add', 'sub', 'mul', 'div', 'copy_lhs', 'copy_rhs']
-reduce_ops = ['sum', 'max', 'min']
-indice_types = ['int32', 'int64']
-feature_types = ['float32', 'float64']
+reduce_op_map = {
+    'max': argmax,
+    'min': argmin
+}
+
+def _spmm(out_shp, binary_op, reduce_op, adj_indptr, adj_indices,
+          ufeat, efeat, edge_id):
+    def msgfunc(*args):
+        row = args[0]
+        row_start = adj_indptr[row]
+        row_end = adj_indptr[row + 1]
+        elem_idx = te.reduce_axis((0, row_end-row_start), name="elem_idx")
+        u_val = ufeat.__getitem__((adj_indices[row_start + elem_idx],) + args[1:])
+        e_val = efeat.__getitem__((edge_id(row_start + elem_idx),) + args[1:])
+        if reduce_op == 'sum':
+            return te.sum(binary_op_map[binary_op](u_val, e_val), axis=elem_idx)
+        else:
+            if binary_op == 'copy_lhs':
+                return reduce_op_map[reduce_op]((adj_indices[row_start + elem_idx], u_val), axis=elem_idx)
+            elif binary_op == 'copy_rhs':
+                return reduce_op_map[reduce_op]((edge_id(row_start + elem_idx), e_val), axis=elem_idx)
+            else:
+                return reduce_op_map[reduce_op]((edge_id(row_start + elem_idx), adj_indices[row_start + elem_idx], \
+                            binary_op_map[binary_op](u_val, e_val)), axis=elem_idx)
+    return te.compute(out_shp, msgfunc, name='out')
+
+def _spmm_feat(out_shp, binary_op, reduce_op, adj_indptr, adj_indices,
+          ufeat, efeat, edge_id, num_feat_partitions):
+    num_cols = ufeat.shape[0]
+    nnz = efeat.shape[0]
+    bcast_ufeat = topi.broadcast_to(ufeat, (num_cols,) + out_shp[1:])
+    bcast_efeat = topi.broadcast_to(efeat, (num_cols,) + out_shp[1:])
+    feat_len = 1
+    for d in out_shp[1:]:
+        feat_len *= d
+    flatten_ufeat = topi.reshape(bcast_ufeat, (num_cols, feat_len))
+    flatten_efeat = topi.reshape(bcast_efeat, (nnz, feat_len))
+    feat_len_per_partition = feat_len // num_feat_partitions
+    reshaped_ufeat = te.compute((num_feat_partitions, num_cols, feat_len_per_partition), \
+                            lambda fo, idx, fi: flatten_ufeat[idx, fo * feat_len_per_partition + fi],
+                            name='reshaped_ufeat')
+    reshaped_efeat = te.compute((num_feat_partitions, nnz, feat_len_per_partition), \
+                            lambda fo, idx, fi: flatten_efeat[idx, fo * feat_len_per_partition + fi],
+                            name='reshaped_efeat')
+    def msgfunc(*args):
+        row = args[0]
+        row_start = adj_indptr[row]
+        row_end = adj_indptr[row + 1]
+        elem_idx = te.reduce_axis((0, row_end-row_start), name="elem_idx")
+        fid = topi.util.ravel_index(args[1:], out_shp[1:])
+        u_val = reshaped_ufeat[fid // feat_len_per_partition, adj_indices[row_start + elem_idx], \
+                                  fid % feat_len_per_partition]
+        e_val = reshaped_efeat[fid // feat_len_per_partition, edge_id(row_start + elem_idx), \
+                                  fid % feat_len_per_partition]
+        if reduce_op == 'sum':
+            return te.sum(binary_op_map[binary_op](u_val, e_val), axis=elem_idx)
+        else:
+            if binary_op == 'copy_lhs':
+                return reduce_op_map[reduce_op]((adj_indices[row_start + elem_idx], u_val), axis=elem_idx)
+            elif binary_op == 'copy_rhs':
+                return reduce_op_map[reduce_op]((edge_id(row_start + elem_idx), e_val), axis=elem_idx)
+            else:
+                return reduce_op_map[reduce_op]((edge_id(row_start + elem_idx), adj_indices[row_start + elem_idx], \
+                            binary_op_map[binary_op](u_val, e_val)), axis=elem_idx)
+    rst = te.compute(out_shp, msgfunc, name='out')
+    return rst, [bcast_ufeat, bcast_efeat, flatten_ufeat, flatten_efeat], [reshaped_ufeat, reshaped_efeat]
+    
+def _spmm_dds(out_shp, binary_op, reduce_op, adj_indptr, adj_indices,
+              ufeat, efeat, edge_id, num_feat_partitions):
+    num_col_partitions = adj_indptr[0]
+    def msgfunc(*args):
+        col_part_idx = args[0]
+        row = args[1]
+        row_start = adj_indptr[col_part_idx, row]
+        row_end = adj_indptr[col_part_idx, row + 1]
+        elem_idx = te.reduce_axis((0, row_end-row_start), name="elem_idx")
+        u_val = ufeat.__getitem__((adj_indices[row_start + elem_idx],) + args[1:])
+        e_val = efeat.__getitem__((edge_id(row_start + elem_idx),) + args[1:])
+        if reduce_op == 'sum':
+            return te.sum(binary_op_map[binary_op](u_val, e_val), axis=elem_idx)
+        else:
+            if binary_op == 'copy_lhs':
+                return reduce_op_map[reduce_op]((adj_indices[row_start + elem_idx], u_val), axis=elem_idx)
+            elif binary_op == 'copy_rhs':
+                return reduce_op_map[reduce_op]((edge_id(row_start + elem_idx), e_val), axis=elem_idx)
+            else:
+                return reduce_op_map[reduce_op]((edge_id(row_start + elem_idx), adj_indices[row_start + elem_idx], \
+                            binary_op_map[binary_op](u_val, e_val)), axis=elem_idx)
+    if reduce_op == 'sum':
+        intermediate = te.compute((num_col_partitions,) + out_shp, msgfunc, name='out')
+    else:
+        if binary_op == 'copy_lhs':
+            argu, intermediate = te.compute((num_col_partitions,) + out_shp, msgfunc, name='out')
+        elif binary_op == 'copy_rhs':
+            arge, intermediate = te.compute((num_col_partitions,) + out_shp, msgfunc, name='out')
+        else:
+            arge, argu, intermediate = te.compute((num_col_partitions,) + out_shp, msgfunc, name='out')
+    k = te.reduce_axis((0, num_col_partitions), name='k')
+    if reduce_op == 'sum':
+        rst =  te.compute(out_shp, lambda *args: te.sum(intermediate.__getitem__((k,) + args), axis=k), name='out')
+    else:
+        if binary_op == 'copy_lhs':
+            rst =  te.compute(out_shp, 
+                lambda *args: reduce_op_map[reduce_op](
+                    (argu.__getitem__((k,) + args), intermediate.__getitem__((k,) + args)), axis=k), 
+                    name='out')
+        if binary_op == 'copy_rhs':
+            rst =  te.compute(out_shp, 
+                lambda *args: reduce_op_map[reduce_op](
+                    (arge.__getitem__((k,) + args), intermediate.__getitem__((k,) + args)), axis=k), 
+                    name='out')
+        else:
+            rst =  te.compute(out_shp,
+                lambda *args: reduce_op_map[reduce_op](arge.__getitem__((k,) + args)
+                    (argu.__getitem__((k,) + args), intermediate.__getitem__((k,) + args)), axis=k), 
+                    name='out')
+    return intermediate, rst
+    
+def _spmm_cuda_general(s, out):
+    edge_axis = out.op.axis[0]
+    feat_axis = s[out].fuse(*out.op.axis[1:])
+    s[out].bind(edge_axis, te.thread_axis('blockIdx.x'))
+    s[out].bind(feat_axis, te.thread_axis('threadIdx.x'))
+
+def _spmm_cuda_tree_reduce(s, out):
+    reduce_axis = out.op.reduce_axis[0]
+    edge_axis = out.op.axis[0]
+    feat_axis = s[out].fuse(*out.op.axis[1:])
+    ro, ri = s[out].split(reduce_axis, factor=32)
+    s[out].bind(ri, te.thread_axis('threadIdx.x'))
+    s[out].bind(feat_axis, te.thread_axis('threadIdx.y'))
+    s[out].bind(edge_axis, te.thread_axis('blockIdx.x'))
+
+def _spmm_cpu(s, out):
+    reduce_axis = out.op.reduce_axis[0]
+    edge_axis = out.op.axis[0]
+    feat_axis = s[out].fuse(*out.op.axis[1:])
+    s[out].reorder(edge_axis, reduce_axis, feat_axis)
+    s[out].parallel(edge_axis)
+
+def _spmm_feat(s, out, inlines, reshapes, num_feat_partitions):
+    for t in inlines:
+        s[t].compute_inline()
+    for t in reshapes:
+        s[t].parallel(t.op.axis[1])
+    reduce_axis = out.op.reduce_axis[0]
+    edge_axis = out.op.axis[0]
+    feat_axis = s[out].fuse(*out.op.axis[1:])
+    fo, fi = s[out].split(feat_axis, nparts = num_feat_partitions)
+    s[out].reorder(fo, edge_axis, reduce_axis, fi)
+    s[out].parallel(edge_axis)
+
+def _spmm_dds_sched(s, out, I):
+    ifeat_axis = s[I].fuse(*I.op.axis[2:])
+    s[I].reorder(I.op.axis[0], I.op.axis[1], I.op.reduce_axis[0], ifeat_axis)
+    ofeat_axis = s[out].fuse(out.op.axis[1:])
+    s[out].reorder(out.op.reduce_axis[0], out.op.axis[0], ofeat_axis)
+    s[I].compute_at(s[out], out.op.reduce_axis[0])
+    s[I].parallel(I.op.axis[1])
+    s[I].vectorize(I.op.axis[2])
+    s[out].parallel(out.op.axis[0])
+    
 
 def spmm(binary_op, reduce_op, nnz, num_rows, num_cols, 
-         lhs_len, rhs_len, out_len,
-         indice_type, feat_type, use_bcast=False, use_idx=False, target='llvm'):
+         lhs_shp, rhs_shp, out_shp,
+         indice_type, feat_type, use_idx=False,
+         num_col_partitions=1, num_feat_partitions=1, target='llvm'):
     if '32' in indice_type:
         indice_type = 'int32'
     elif '64' in indice_type:
@@ -72,212 +230,89 @@ def spmm(binary_op, reduce_op, nnz, num_rows, num_cols,
     else:
         raise NotImplementedError
     # placeholder for sparse matrix
-    adj_indptr = te.placeholder((num_rows+1,), indice_type, 'adj_indptr')
+    if num_col_partitions > 1:
+        adj_indptr = te.placeholder((num_col_partitions, num_rows+1), indice_type, 'adj_indptr')
+    else:
+        adj_indptr = te.placeholder((num_rows+1,), indice_type, 'adj_indptr')
     adj_indices = te.placeholder((nnz,), indice_type, 'adj_indices')
-    dst_feat = te.placeholder((nnz, rhs_len), feat_type, 'dst_feat')
+    efeat = te.placeholder((nnz,) + rhs_shp, feat_type, 'efeat')
     edge_mapping = te.placeholder((nnz,), indice_type, 'edge_mapping')
     # placeholder for dense features
-    src_feat = te.placeholder((num_cols, lhs_len), feat_type, 'src_feat')
-    # placeholder for possible broadcasting offset
-    lhs_off = te.placeholder((out_len,), indice_type, 'lhs_off')
-    rhs_off = te.placeholder((out_len,), indice_type, 'rhs_off')
+    ufeat = te.placeholder((num_cols,) + lhs_shp, feat_type, 'ufeat')
     # compute
     use_u = binary_op != 'copy_rhs'
     use_e = binary_op != 'copy_lhs'
-    def msgfunc(row, fid):
-        row_start = adj_indptr[row]
-        row_end = adj_indptr[row + 1]
-        row_num_elems = row_end - row_start
-        elem_idx = te.reduce_axis((0, row_num_elems), name="elem_idx")
-        adj_val = dst_feat[edge_mapping[row_start+elem_idx] if use_idx else row_start + elem_idx, \
-            rhs_off[fid] if use_bcast else fid]
-        feat_val = src_feat[adj_indices[row_start + elem_idx], lhs_off[fid] if use_bcast else fid]
-        if reduce_op == 'sum':
-            return te.sum(binary_op_map[binary_op](feat_val, adj_val), axis=elem_idx)
-        elif reduce_op == 'max':
-            if binary_op == 'copy_lhs':
-                return argmax((adj_indices[row_start + elem_idx], feat_val), axis=elem_idx)
-            elif binary_op == 'copy_rhs':
-                return argmax((edge_mapping[row_start+elem_idx] if use_idx else row_start+elem_idx, \
-                    adj_val), axis=elem_idx)
-            else:
-                return argmax((edge_mapping[row_start+elem_idx] if use_idx else row_start+elem_idx, \
-                    adj_indices[row_start + elem_idx], \
-                    binary_op_map[binary_op](feat_val, adj_val)), axis=elem_idx)
-        elif reduce_op == 'min':
-            if binary_op == 'copy_lhs':
-                return argmin((adj_indices[row_start + elem_idx], feat_val), axis=elem_idx)
-            elif binary_op == 'copy_rhs':
-                return argmin((edge_mapping[row_start+elem_idx] if use_idx else row_start+elem_idx, \
-                    adj_val), axis=elem_idx)
-            else:
-                return argmin((edge_mapping[row_start+elem_idx] if use_idx else row_start+elem_idx, \
-                    adj_indices[row_start + elem_idx], \
-                    binary_op_map[binary_op](feat_val, adj_val)), axis=elem_idx)
+    def edge_id(x):
+        return edge_mapping[x] if use_idx else x
+    if num_feat_partitions == 1:
+        if num_col_partitions == 1:
+            rst = _spmm((num_rows,) + out_shp, binary_op, reduce_op, adj_indptr, adj_indices,
+                            ufeat, efeat, edge_id)
+        else:
+            intermediate, rst = _spmm_dds((num_rows,) + out_shp, binary_op, reduce_op, adj_indptr, adj_indices,
+                ufeat, efeat, edge_id)
+    else:
+        if num_col_partitions == 1:
+            rst, inlines, reshapes = _spmm_feat((num_rows,) + out_shp, binary_op, reduce_op, adj_indptr, adj_indices,
+                ufeat, efeat, edge_id, num_feat_partitions)
         else:
             raise NotImplementedError
     if reduce_op == 'sum':
-        out = te.compute((num_rows, out_len), msgfunc, name='out')
+        out = rst
     else:
-        if binary_op == 'copy_lhs':
-            argu, out = te.compute((num_rows, out_len), msgfunc, name='out')
-        elif binary_op == 'copy_rhs':
-            arge, out = te.compute((num_rows, out_len), msgfunc, name='out')
-        else:
-            arge, argu, out = te.compute((num_rows, out_len), msgfunc, name='out')
+        out = rst[-1]
     # prepare input
     f_input = [adj_indptr, adj_indices]
     f_name = '_'.join(str(x) for x in [
         'spmm', binary_op, reduce_op, nnz, num_rows, 
-        num_cols, out_len, indice_type, feat_type
+        num_cols, indice_type, feat_type
         ])
-    ops = [out.op]
     if use_u:
-        f_input.append(src_feat)
+        f_input.append(ufeat)
     if use_e:
-        f_input.append(dst_feat)
-    if use_bcast:
-        f_input += [lhs_off, rhs_off]
-        f_name += '_bcast'
+        f_input.append(efeat)
     if reduce_op != 'sum':
-        if use_u:
-            f_input.append(argu)
-            ops.append(argu.op)
-        if use_e:
-            f_input.append(arge)
-            ops.append(arge.op)
+        if use_u and use_e:
+            f_input += [rst[1], rst[0]]
+        else:
+            f_input.append(rst[0])
     if use_idx:
         f_input.append(edge_mapping)
         f_name += '_idx'
     f_input.append(out)
     # schedule
-    edge_axis, feat_axis = out.op.axis
-    reduce_axis = out.op.reduce_axis[0]    
-    s = te.create_schedule(ops)
+    s = te.create_schedule(out.op)
     if target == 'cuda':
         # cuda schedule
-        if out_len < 16:
+        if topi.util.get_const_int(topi.util.prod(out.shape[1:])) < 16:
             # use tree reduce if feat_len is small
-            ro, ri = s[out].split(reduce_axis, factor=32)
-            s[out].bind(ri, te.thread_axis('threadIdx.x'))
-            s[out].bind(feat_axis, te.thread_axis('threadIdx.y'))
+            _spmm_cuda_tree_reduce(s, out)
         else:
             #othrewise just parallel on feature dimension
-            s[out].bind(feat_axis, te.thread_axis('threadIdx.x'))
-        s[out].bind(edge_axis, te.thread_axis('blockIdx.x'))
+            _spmm_cuda_general(s, out)
     else:
         # llvm schedule
-        # pass
-        s[out].reorder(edge_axis, reduce_axis, feat_axis)
-        s[out].parallel(edge_axis)
-        s[out].pragma(edge_axis, 'parallel_launch_point')
-        s[out].pragma(edge_axis, 'parallel_stride_pattern', 8)
-        # make compiling really slow when shape is not good
-        # s[out].vectorize(feat_axis)
-    return tvm.build(s, f_input, target=target, name=f_name)
-
-def spmm_dds(binary_op, reduce_op, d1_size, d2_size, num_cols,
-             nnz, lhs_len, rhs_len, out_len,
-             indice_type, feat_type, 
-             num_feat_partitions=1, use_bcast=False, target='llvm'):
-    # placeholder for dds format
-    adj_s1_pos = te.placeholder((d1_size, d2_size), dtype=indice_type, name='adj_s1_pos')
-    adj_s1_idx = te.placeholder((nnz,), dtype=indice_type, name='adj_s1_idx')
-    adj_vals = te.placeholder((nnz, rhs_len), dtype=feat_type, name='adj_vals')
-    num_rows = d2_size - 1
-    # num_src_vertices_per_partition = (num_cols + d1_size - 1) // d1_size
-    # placeholder for dense features
-    src_feat = te.placeholder((num_cols, lhs_len), dtype=feat_type, name='src_feat')
-    # placeholder for possible broadcasting offset
-    lhs_off = te.placeholder((out_len,), indice_type, 'lhs_off')
-    rhs_off = te.placeholder((out_len,), indice_type, 'rhs_off')
-    # compute
-    if num_feat_partitions > 1:
-        feat_len_per_partition = out_len // num_feat_partitions
-        reshaped_src_feat = te.compute((num_feat_partitions, num_cols, feat_len_per_partition),
-                                        lambda fo, cid, fi: src_feat[cid, lhs_off[fo*feat_len_per_partition+fi] \
-                                        if use_bcast else fo*feat_len_per_partition+fi], name='reshaped_src_feat')
-        def msgfunc(fo, src_vertex_partition_idx, row, fi):
-            row_start = adj_s1_pos[src_vertex_partition_idx, row]
-            row_end = adj_s1_pos[src_vertex_partition_idx, row + 1]
-            row_num_elems = row_end - row_start
-            elem_idx = te.reduce_axis((0, row_num_elems), name="elem_idx")
-            adj_val = adj_vals[row_start + elem_idx, rhs_off[fo*feat_len_per_partition+fi] \
-                            if use_bcast else fo*feat_len_per_partition+fi]
-            feat_val = reshaped_src_feat[fo, adj_s1_idx[row_start + elem_idx], fi]
-            return reduce_op_map[reduce_op](binary_op_map[binary_op](feat_val, adj_val), axis=elem_idx)
-        intermediate = te.compute((num_feat_partitions, d1_size, num_rows, feat_len_per_partition),
-                                msgfunc, name='intermediate')
-        k = te.reduce_axis((0, d1_size), name='src_vertex_partition_reduce')
-        reshaped_out = te.compute((num_feat_partitions, num_rows, feat_len_per_partition), 
-                                lambda fo, nn, fi: reduce_op_map[reduce_op](intermediate[fo, k, nn, fi], axis=k),
-                                name='reshaped_out')
-        out = te.compute((num_rows, out_len), 
-                        lambda nn, ff: reshaped_out[ff // feat_len_per_partition, nn, ff % feat_len_per_partition], name='out')
-    else:
-        def msgfunc(src_vertex_partition_idx, row, fid):
-            row_start = adj_s1_pos[src_vertex_partition_idx, row]
-            row_end = adj_s1_pos[src_vertex_partition_idx, row + 1]
-            row_num_elems = row_end - row_start
-            elem_idx = te.reduce_axis((0, row_num_elems), name="elem_idx")
-            adj_val = adj_vals[row_start + elem_idx, rhs_off[fid] if use_bcast else fid]
-            feat_val = src_feat[adj_s1_idx[row_start + elem_idx], fid]
-            return reduce_op_map[reduce_op](binary_op_map[binary_op](feat_val, adj_val), axis=elem_idx)
-        k = te.reduce_axis((0, d1_size), name='src_vertex_partition_reduce')
-        intermediate = te.compute((d1_size, num_rows, out_len), msgfunc, name='intermediate')
-        out = te.compute((num_rows, out_len), 
-            lambda nn, fid: reduce_op_map[reduce_op](intermediate[k, nn, fid], axis=k), name='out')
-    # schedule
-    s = te.create_schedule([out.op])
-    if num_feat_partitions > 1:
-        I, RO = intermediate, reshaped_out
-        s[I].reorder(I.op.axis[0], I.op.axis[1], I.op.axis[2], I.op.reduce_axis[0], I.op.axis[3])
-        s[RO].reorder(RO.op.axis[0], RO.op.reduce_axis[0], RO.op.axis[1], RO.op.axis[2])
-        s[I].compute_at(s[RO], RO.op.reduce_axis[0])
-        # Parallelize the rows of the sparse matrix
-        s[reshaped_src_feat].parallel(reshaped_src_feat.op.axis[1])
-        s[I].parallel(I.op.axis[2])
-        s[I].vectorize(I.op.axis[3])
-        s[RO].parallel(RO.op.axis[1])
-        s[out].parallel(out.op.axis[0])
-    else:
-        I = intermediate
-        s[I].reorder(I.op.axis[0], I.op.axis[1], I.op.reduce_axis[0], I.op.axis[2])
-        s[out].reorder(out.op.reduce_axis[0], out.op.axis[0], out.op.axis[1])
-        s[I].compute_at(s[out], out.op.reduce_axis[0])
-        s[I].parallel(I.op.axis[1])
-        s[I].vectorize(I.op.axis[2])
-        s[out].parallel(out.op.axis[0])
-    # prepare input
-    f_input = [adj_s1_pos, adj_s1_idx]
-    f_name = '_'.join(str(x) for x in [
-        'spmm', binary_op, reduce_op, nnz, num_rows, 
-        num_cols, d1_size, 'partitioned', out_len, indice_type, feat_type
-        ])
-    if binary_op == 'copy_lhs':
-        f_input.append(src_feat)
-    elif binary_op == 'copy_rhs':
-        f_input.append(adj_vals)
-    else:
-        f_input += [src_feat, adj_vals]
-    if use_bcast:
-        f_input += [lhs_off, rhs_off]
-        f_name += '_bcast'
-    f_input.append(out)
-    # print(tvm.lower(s, f_input))
-    return tvm.build(s, f_input, target=target, name=f_name)
+        if num_col_partitions == 1:
+            if num_feat_partitions > 1:
+                _spmm_feat(s, out, inlines, reshapes, num_feat_partitions)
+            else:
+                _spmm_cpu(s, out)
+        else:
+            _spmm_dds(s, out, intermediate)
+    # bind autobroadcast buffer
+    u_buffer = tvm.tir.decl_buffer(ufeat.shape, ufeat.dtype, name='u_buf', buffer_type='auto_broadcast')
+    e_buffer = tvm.tir.decl_buffer(efeat.shape, efeat.dtype, name='e_buf', buffer_type='auto_broadcast')
+    # print(tvm.lower(s, f_input), binds={ufeat:u_buffer, efeat: e_buffer})
+    return tvm.build(s, f_input, target=target, name=f_name, binds={ufeat:u_buffer, efeat: e_buffer})
 
 if __name__ == '__main__':
-    # import dgl
-    target = 'llvm'
-    # g = dgl.rand_graph(100,30)
-    lhs_len, rhs_len = 105, 21
-    out_len = int(15 * 49)
-    use_bcast = True
-    nnz = 3000
-    num_rows = 80
-    num_cols = 160
+    target = 'cuda'
+    lhs_shp, rhs_shp = (8,), (8,)
+    out_shp = (8,)
+    nnz = 5
+    num_rows = 10
+    num_cols = 10
     indice_type = 'int32'
     feat_type = 'float32'
-    f = spmm('add', 'sum', nnz, num_rows, num_cols, lhs_len, rhs_len, out_len, indice_type, feat_type, use_bcast=use_bcast, target=target)
-    # print(f.imported_modules[0].get_source())
+    f = spmm('add', 'sum', nnz, num_rows, num_cols, lhs_shp, rhs_shp, out_shp, indice_type, feat_type, target=target, num_feat_partitions=1)
+    print(f.imported_modules[0].get_source())

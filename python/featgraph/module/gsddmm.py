@@ -1,10 +1,6 @@
 import tvm
 from tvm import te
-from tvm import autotvm
-import numpy as np
-import topi
-
-from featgraph.util import calc_bcast
+from tvm import topi
 
 binary_op_map = {
     'add': lambda x,y : x+y,
@@ -22,8 +18,8 @@ def _sddmm_compute(out_shp, binary_op, lhs, rhs,
         out = te.compute(
             out_shp,
             lambda *args: te.sum(
-                lhs.__getitem__((lhs_idx(args[0]),) + (args[1:] if out_shp[1:] != (1,) else ()) +(k,)) * \
-                rhs.__getitem__((rhs_idx(args[0]),) + (args[1:] if out_shp[1:] != (1,) else ()) +(k,)),
+                lhs.__getitem__((lhs_idx(args[0]),) + args[1:-1] +(k,)) * \
+                rhs.__getitem__((rhs_idx(args[0]),) + args[1:-1] +(k,)),
                 axis=k
             ),
             name='out'
@@ -92,22 +88,18 @@ def _sddmm_compute_feat_partition(out_shp, binary_op, lhs, rhs,
     return out, feat_len_per_partition, [reshaped_lhs, reshaped_rhs], [bcast_lhs, bcast_rhs, flatten_lhs, flatten_rhs]
 
 def _sddmm_cuda_general(s, out):
-    out_len = out.shape[1]
-    edge_axis, feat_axis = out.op.axis
-    nnz = out.shape[0]
+    out_len = topi.util.get_const_int(topi.util.prod(out.shape[1:]))
+    edge_axis = out.op.axis[0]
+    feat_axis = s[out].fuse(*out.op.axis[1:])
     ntx = tvm.autotvm.task.space.get_pow2s(out_len)[-1]
     ntx = 1024 if ntx > 1024 else ntx
     nty = 1024 // ntx
     fo, fi = s[out].split(feat_axis, factor=ntx)
     eo, ei = s[out].split(edge_axis, factor=nty)
-    nby = (nnz + nty - 1) // nty
-    if nby > 65535:
-        eo, e = s[out].split(eo, nparts = 65535)
-        s[out].reorder(eo, e, ei, fo, fi)
     s[out].bind(fi, te.thread_axis('threadIdx.x'))
-    s[out].bind(fo, te.thread_axis('blockIdx.x'))
+    s[out].bind(fo, te.thread_axis('blockIdx.y'))
     s[out].bind(ei, te.thread_axis('threadIdx.y'))
-    s[out].bind(eo, te.thread_axis('blockIdx.y'))
+    s[out].bind(eo, te.thread_axis('blockIdx.x'))
 
 def _sddmm_cuda_tree_reduce(s, out):
     edge_axis = out.op.axis[0]
@@ -208,7 +200,7 @@ def sddmm(binary_op, nnz, num_rows, num_cols,
         f_input.append(adj_col_indices)
     f_name = '_'.join(str(x) for x in [
         'sddmm', binary_op, nnz, num_rows, num_cols,
-         lhs_target, rhs_target, lhs_shp, rhs_shp,
+         lhs_target, rhs_target,
          indice_type, feat_type
          ])
     f_input += [lhs, rhs, out]
@@ -233,13 +225,14 @@ def sddmm(binary_op, nnz, num_rows, num_cols,
     return tvm.build(s, f_input, target=target, name=f_name, binds={lhs:lhs_buffer, rhs:rhs_buffer})
 
 if __name__ == '__main__':
+    print('hello')
     import numpy as np
     import dgl
     import dgl.backend as F
     target = 'llvm'
     lhs_shp = (1024,)
     rhs_shp = (1024,)
-    out_shp = (1,)
+    out_shp = (1024,)
     nnz = 3000
     num_rows = 100
     num_cols = 100
@@ -248,21 +241,7 @@ if __name__ == '__main__':
     row, col, _ = map(lambda x: tvm.nd.from_dlpack(x.to_dlpack()), gidx.get_coo_dlpack(0))
     indice_type = 'int32'
     feat_type = 'float32'
-    op = 'dot'
+    op = 'add'
     f1 = sddmm(op, nnz, num_rows, num_cols, lhs_shp, rhs_shp, out_shp, indice_type, feat_type,\
-                lhs_target=0, rhs_target=2, target=target, num_feat_partitions=32)
-    f2 = sddmm(op, nnz, num_rows, num_cols, lhs_shp, rhs_shp, out_shp, indice_type, feat_type,\
-                lhs_target=0, rhs_target=2, target=target, num_feat_partitions=1)
-    np_lhs = np.random.random((num_rows,) + lhs_shp).astype(np.float32)
-    np_rhs = np.random.random((num_cols,) + rhs_shp).astype(np.float32)
-    lhs = tvm.nd.array(np_lhs)
-    rhs = tvm.nd.array(np_rhs)
-    out = tvm.nd.array(np.zeros((nnz,) + out_shp, np.float32))
-    f1(row, col, lhs, rhs, out)
-    print(out)
-    f2(row, col, lhs, rhs, out)
-    print(out)
-    t1 = f1.time_evaluator(f1.entry_name, ctx=tvm.cpu(0), number=50)
-    t2 = f2.time_evaluator(f2.entry_name, ctx=tvm.cpu(0), number=50)
-    print(t1(row, col, lhs, rhs, out).mean)
-    print(t2(row, col, lhs, rhs, out).mean)
+                lhs_target=0, rhs_target=2, target='cuda', num_feat_partitions=1)
+    # print(f1.imported_modules[0].get_source())
