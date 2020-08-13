@@ -118,16 +118,16 @@ def _spmm_feat(out_shp, binary_op, reduce_op, adj_indptr, adj_indices,
     return rst, [bcast_ufeat, bcast_efeat, flatten_ufeat, flatten_efeat], [reshaped_ufeat, reshaped_efeat]
     
 def _spmm_dds(out_shp, binary_op, reduce_op, adj_indptr, adj_indices,
-              ufeat, efeat, edge_id, num_feat_partitions):
-    num_col_partitions = adj_indptr[0]
+              ufeat, efeat, edge_id):
+    num_col_partitions = adj_indptr.shape[0]
     def msgfunc(*args):
         col_part_idx = args[0]
         row = args[1]
         row_start = adj_indptr[col_part_idx, row]
         row_end = adj_indptr[col_part_idx, row + 1]
         elem_idx = te.reduce_axis((0, row_end-row_start), name="elem_idx")
-        u_val = ufeat.__getitem__((adj_indices[row_start + elem_idx],) + args[1:])
-        e_val = efeat.__getitem__((edge_id(row_start + elem_idx),) + args[1:])
+        u_val = ufeat.__getitem__((adj_indices[row_start + elem_idx],) + args[2:])
+        e_val = efeat.__getitem__((edge_id(row_start + elem_idx),) + args[2:])
         if reduce_op == 'sum':
             return te.sum(binary_op_map[binary_op](u_val, e_val), axis=elem_idx)
         else:
@@ -138,16 +138,18 @@ def _spmm_dds(out_shp, binary_op, reduce_op, adj_indptr, adj_indices,
             else:
                 return reduce_op_map[reduce_op]((edge_id(row_start + elem_idx), adj_indices[row_start + elem_idx], \
                             binary_op_map[binary_op](u_val, e_val)), axis=elem_idx)
+    # process segments
     if reduce_op == 'sum':
-        intermediate = te.compute((num_col_partitions,) + out_shp, msgfunc, name='out')
+        intermediate = te.compute((num_col_partitions,) + out_shp, msgfunc, name='intermediate')
     else:
         if binary_op == 'copy_lhs':
-            argu, intermediate = te.compute((num_col_partitions,) + out_shp, msgfunc, name='out')
+            argu, intermediate = te.compute((num_col_partitions,) + out_shp, msgfunc, name='intermediate')
         elif binary_op == 'copy_rhs':
-            arge, intermediate = te.compute((num_col_partitions,) + out_shp, msgfunc, name='out')
+            arge, intermediate = te.compute((num_col_partitions,) + out_shp, msgfunc, name='intermediate')
         else:
-            arge, argu, intermediate = te.compute((num_col_partitions,) + out_shp, msgfunc, name='out')
+            arge, argu, intermediate = te.compute((num_col_partitions,) + out_shp, msgfunc, name='intermediate')
     k = te.reduce_axis((0, num_col_partitions), name='k')
+    # merge segments
     if reduce_op == 'sum':
         rst =  te.compute(out_shp, lambda *args: te.sum(intermediate.__getitem__((k,) + args), axis=k), name='out')
     else:
@@ -156,15 +158,15 @@ def _spmm_dds(out_shp, binary_op, reduce_op, adj_indptr, adj_indices,
                 lambda *args: reduce_op_map[reduce_op](
                     (argu.__getitem__((k,) + args), intermediate.__getitem__((k,) + args)), axis=k), 
                     name='out')
-        if binary_op == 'copy_rhs':
+        elif binary_op == 'copy_rhs':
             rst =  te.compute(out_shp, 
                 lambda *args: reduce_op_map[reduce_op](
                     (arge.__getitem__((k,) + args), intermediate.__getitem__((k,) + args)), axis=k), 
                     name='out')
         else:
             rst =  te.compute(out_shp,
-                lambda *args: reduce_op_map[reduce_op](arge.__getitem__((k,) + args)
-                    (argu.__getitem__((k,) + args), intermediate.__getitem__((k,) + args)), axis=k), 
+                lambda *args: reduce_op_map[reduce_op]((arge.__getitem__((k,) + args),
+                    argu.__getitem__((k,) + args), intermediate.__getitem__((k,) + args)), axis=k), 
                     name='out')
     return intermediate, rst
     
@@ -205,11 +207,11 @@ def _spmm_feat(s, out, inlines, reshapes, num_feat_partitions):
 def _spmm_dds_sched(s, out, I):
     ifeat_axis = s[I].fuse(*I.op.axis[2:])
     s[I].reorder(I.op.axis[0], I.op.axis[1], I.op.reduce_axis[0], ifeat_axis)
-    ofeat_axis = s[out].fuse(out.op.axis[1:])
+    ofeat_axis = s[out].fuse(*out.op.axis[1:])
     s[out].reorder(out.op.reduce_axis[0], out.op.axis[0], ofeat_axis)
     s[I].compute_at(s[out], out.op.reduce_axis[0])
     s[I].parallel(I.op.axis[1])
-    s[I].vectorize(I.op.axis[2])
+    # s[I].vectorize(I.op.axis[2])
     s[out].parallel(out.op.axis[0])
     
 
@@ -227,9 +229,18 @@ def spmm(binary_op, reduce_op, nnz, num_rows, num_cols,
         feat_type = 'float32'
     elif '64' in feat_type:
         feat_type = 'float64'
+    elif '16' in feat_type:
+        feat_type = 'float16'
     else:
         raise NotImplementedError
     # placeholder for sparse matrix
+    generic_shape = nnz == 0 and num_rows == 0 and num_cols == 0
+    if generic_shape:
+        num_rows = te.var('num_rows', indice_type)
+        num_cols = te.var('num_cols', indice_type)
+        nnz = te.var('nnz', indice_type)
+        if num_col_partitions > 1:
+            raise NotImplementedError
     if num_col_partitions > 1:
         adj_indptr = te.placeholder((num_col_partitions, num_rows+1), indice_type, 'adj_indptr')
     else:
@@ -298,17 +309,71 @@ def spmm(binary_op, reduce_op, nnz, num_rows, num_cols,
             else:
                 _spmm_cpu(s, out)
         else:
-            _spmm_dds(s, out, intermediate)
+            _spmm_dds_sched(s, out, intermediate)
     # bind autobroadcast buffer
     u_buffer = tvm.tir.decl_buffer(ufeat.shape, ufeat.dtype, name='u_buf', buffer_type='auto_broadcast')
     e_buffer = tvm.tir.decl_buffer(efeat.shape, efeat.dtype, name='e_buf', buffer_type='auto_broadcast')
     # print(tvm.lower(s, f_input), binds={ufeat:u_buffer, efeat: e_buffer})
     return tvm.build(s, f_input, target=target, name=f_name, binds={ufeat:u_buffer, efeat: e_buffer})
 
+@te.hybrid.script
+def _typed_spmm_llvm(adj_indptr, adj_indices, type_mapping, ufeat, type_feat):
+    out = output_tensor((num_rows, ufeat.shape[1], type_feat.shape[2]))
+    for row in parallel(adj_indptr.shape[0] - 1):
+        for elem in range(adj_indptr[row], adj_indptr[row+1]):
+            for i in range(ufeat.shape[1]):
+                for j in range(ufeat.shape[2]):
+                    for k in range(type_feat.shape[2]):
+                        out[row, i, k] += ufeat[adj_indices[elem], i, j] * type_feat[type_mapping[elem], j, k]
+    return out
+
+@te.hybrid.script
+def _typed_spmm_cuda(adj_indptr, adj_indices, type_mapping, ufeat, type_feat):
+    out = output_tensor((num_rows, ufeat.shape[1], type_feat.shape[2]))
+    for row in bind('blockIdx.x', adj_indptr.shape[0] - 1):
+        for elem in range(adj_indptr[row], adj_indptr[row+1]):
+            for i in bind('threadIdx.y', ufeat.shape[1]):
+                for j in range(ufeat.shape[2]):
+                    for k in bind('threadIdx.x', type_feat.shape[2]):
+                        out[row, i, k] += ufeat[adj_indices[elem], i, j] * type_feat[type_mapping[elem], j, k]
+    return out
+
+def typed_spmm(nnz, num_rows, num_cols, 
+               num_types, lhs_shp, rhs_shp,
+               indice_type, feat_type, target='llvm'):
+    if '32' in indice_type:
+        indice_type = 'int32'
+    elif '64' in indice_type:
+        indice_type = 'int64'
+    else:
+        raise NotImplementedError
+    if '16' in feat_type:
+        feat_type = 'float16'
+    elif '32' in feat_type:
+        feat_type = 'float32'
+    elif '64' in feat_type:
+        feat_type = 'float64'
+    else:
+        raise NotImplementedError
+    adj_indptr = te.placeholder((num_rows+1,), indice_type, 'adj_indptr')
+    adj_indices = te.placeholder((nnz,), indice_type, 'adj_indices')
+    type_feat = te.placeholder((num_types,) + rhs_shp, feat_type, 'type_feat')
+    type_mapping = te.placeholder((nnz,), indice_type, 'type_mapping')
+    ufeat = te.placeholder((num_cols,) + lhs_shp, feat_type, 'ufeat')
+    if target == 'llvm':
+        out = _typed_spmm_llvm(adj_indptr, adj_indices, type_mapping, ufeat, type_feat)
+    else:
+        out = _typed_spmm_cuda(adj_indptr, adj_indices, type_mapping, ufeat, type_feat)
+    s = te.create_schedule(out.op)
+    ir = tvm.lower(s, [adj_indptr, adj_indices, type_feat, type_mapping, ufeat, out])
+    print(ir)
+    f = tvm.build(ir, target=target)
+    # print(f.imported_modules[0].get_source())
+
 if __name__ == '__main__':
-    target = 'cuda'
-    lhs_shp, rhs_shp = (8,), (8,)
-    out_shp = (8,)
+    target = 'llvm'
+    lhs_shp, rhs_shp = (32,), (32,)
+    out_shp = (32,)
     nnz = 5
     num_rows = 10
     num_cols = 10
@@ -316,3 +381,4 @@ if __name__ == '__main__':
     feat_type = 'float32'
     f = spmm('add', 'sum', nnz, num_rows, num_cols, lhs_shp, rhs_shp, out_shp, indice_type, feat_type, target=target, num_feat_partitions=1)
     print(f.imported_modules[0].get_source())
+    # typed_spmm(nnz, num_rows, num_cols, 2, (1,10), (10, 2), indice_type, feat_type)

@@ -10,8 +10,7 @@ binary_op_map = {
 }
 
 def _sddmm_compute(out_shp, binary_op, lhs, rhs, 
-                  lhs_idx, rhs_idx, 
-                  num_feat_partitions=1):
+                  lhs_idx, rhs_idx):
     reduce_size = lhs.shape[-1]
     if binary_op == 'dot':
         k = te.reduce_axis((0, reduce_size), name='k')
@@ -115,10 +114,8 @@ def _sddmm_cuda_tree_reduce(s, out):
 def _sddmm_cpu_general(s, out):
     edge_axis = out.op.axis[0]
     s[out].parallel(edge_axis)
-    # s[out].pragma(edge_axis, 'parallel_launch_point')
-    # s[out].pragma(edge_axis, 'parallel_stride_pattern', 8)
     
-def _sddmm_cpu_feat_partition(s, out, reshaped, inline, reduce_size, feat_len_per_partition):
+def _sddmm_cpu_feat_partition(s, out, op, reshaped, inline, reduce_size, feat_len_per_partition):
     for t in inline:
         s[t].compute_inline()
     for t in reshaped:
@@ -151,12 +148,19 @@ def sddmm(binary_op, nnz, num_rows, num_cols,
         indice_type = 'int64'
     else:
         raise NotImplementedError
-    if '32' in feat_type:
+    if '16' in feat_type:
+        feat_type = 'float16'
+    elif '32' in feat_type:
         feat_type = 'float32'
     elif '64' in feat_type:
         feat_type = 'float64'
     else:
         raise NotImplementedError
+    generic_shape = nnz == 0 and num_rows == 0 and num_cols == 0
+    if generic_shape:
+        num_rows = te.var('num_rows', indice_type)
+        num_cols = te.var('num_cols', indice_type)
+        nnz = te.var('nnz', indice_type)
     # check should be done in infer_out_shape
     if binary_op == 'dot':
         reduce_size = lhs_shp[-1]
@@ -217,7 +221,7 @@ def sddmm(binary_op, nnz, num_rows, num_cols,
         if num_feat_partitions == 1:
             _sddmm_cpu_general(s, out)
         else:
-            _sddmm_cpu_feat_partition(s, out, reshaped, inline, reduce_size, feat_len_per_partition)
+            _sddmm_cpu_feat_partition(s, out, binary_op, reshaped, inline, reduce_size, feat_len_per_partition)
     # bind autobroadcast buffer
     lhs_buffer = tvm.tir.decl_buffer(lhs.shape, lhs.dtype, name='lhs_buf', buffer_type='auto_broadcast')
     rhs_buffer = tvm.tir.decl_buffer(rhs.shape, rhs.dtype, name='rhs_buf', buffer_type='auto_broadcast')
