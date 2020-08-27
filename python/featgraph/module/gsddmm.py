@@ -10,81 +10,65 @@ binary_op_map = {
 }
 
 def _sddmm_compute(out_shp, binary_op, lhs, rhs, 
-                  lhs_idx, rhs_idx):
-    reduce_size = lhs.shape[-1]
-    if binary_op == 'dot':
-        k = te.reduce_axis((0, reduce_size), name='k')
-        out = te.compute(
-            out_shp,
-            lambda *args: te.sum(
-                lhs.__getitem__((lhs_idx(args[0]),) + args[1:-1] +(k,)) * \
-                rhs.__getitem__((rhs_idx(args[0]),) + args[1:-1] +(k,)),
-                axis=k
-            ),
-            name='out'
-        )
-    else:
-        out = te.compute(out_shp, 
-                lambda *args: binary_op_map[binary_op](
-                    lhs.__getitem__((lhs_idx(args[0]),) + args[1:]), 
-                    rhs.__getitem__((rhs_idx(args[0]),) + args[1:])
-                ),
-                name='out')
-    return out
-
-def _sddmm_compute_feat_partition(out_shp, binary_op, lhs, rhs, 
-                                  lhs_idx, rhs_idx, 
-                                  num_feat_partitions=1):
+                   lhs_idx, rhs_idx, num_feat_partitions=1,
+                   lhs_pack=False, rhs_pack=False):
     reduce_size = lhs.shape[-1] if binary_op == 'dot' else 1
-    if binary_op != 'dot':
-        feat_shp = out_shp[1:]
-    else:
-        if out_shp[1:] != (1,):
-            feat_shp = out_shp[1:] + (reduce_size,)
-        else:
-            feat_shp = (reduce_size,)
-    bcast_lhs = topi.broadcast_to(lhs, (lhs.shape[0],) + feat_shp)
-    bcast_rhs = topi.broadcast_to(rhs, (rhs.shape[0],) + feat_shp)
     feat_len = 1
     for d in out_shp[1:]:
         feat_len *= d
     feat_len *= reduce_size
-    flatten_lhs = topi.reshape(bcast_lhs, (lhs.shape[0], feat_len))
-    flatten_rhs = topi.reshape(bcast_rhs, (rhs.shape[0], feat_len))
     # assume feat_len is a multiply of num_feat_partitions
     feat_len_per_partition = feat_len // num_feat_partitions
-    reshaped_lhs = te.compute((num_feat_partitions, lhs.shape[0], feat_len_per_partition), \
-                               lambda fo, idx, fi: flatten_lhs[idx, fo * feat_len_per_partition + fi],
-                               name='reshaped_lhs')
-    reshaped_rhs = te.compute((num_feat_partitions, rhs.shape[0], feat_len_per_partition), \
-                               lambda fo, idx, fi: flatten_rhs[idx, fo * feat_len_per_partition + fi],
-                               name='reshaped_rhs')
+    inlines, reshapes = [], []
+    if lhs_pack:
+        flatten_lhs = topi.reshape(lhs, (lhs.shape[0], feat_len))
+        reshaped_lhs = te.compute((num_feat_partitions, lhs.shape[0], feat_len_per_partition), \
+                                    lambda fo, idx, fi: flatten_lhs[lhs_idx(idx, True), fo * feat_len_per_partition + fi],
+                                    name='reshaped_lhs')
+        inlines.append(flatten_lhs)
+        reshapes.append(reshaped_lhs)
+    if rhs_pack:
+        flatten_rhs = topi.reshape(rhs, (rhs.shape[0], feat_len))
+        reshaped_rhs = te.compute((num_feat_partitions, rhs.shape[0], feat_len_per_partition), \
+                                    lambda fo, idx, fi: flatten_rhs[rhs_idx(idx, True), fo * feat_len_per_partition + fi],
+                                    name='reshaped_rhs')
+        inlines.append(flatten_rhs)
+        reshapes.append(reshaped_rhs)
     if binary_op == 'dot':
         k = te.reduce_axis((0, reduce_size), name='k')
-        def dot_edge_func(*indice):
-            eid = indice[0]
-            fid = topi.util.ravel_index(indice[1:], out_shp[1:])
+        def dot_edge_func(*args):
+            eid = args[0]
+            fid = topi.util.ravel_index(args[1:], out_shp[1:])
             fid *= reduce_size
-            return te.sum(
-                reshaped_lhs[(fid + k) // feat_len_per_partition, \
-                            lhs_idx(eid), (fid + k) % feat_len_per_partition] * \
-                reshaped_rhs[(fid + k) // feat_len_per_partition, \
-                            rhs_idx(eid), (fid + k) % feat_len_per_partition],
-                axis=k
-            )
+            if lhs_pack:
+                lval = reshaped_lhs[(fid + k) // feat_len_per_partition, \
+                            lhs_idx(eid), (fid + k) % feat_len_per_partition]
+            else:
+                lval = lhs.__getitem__((lhs_idx(args[0]),) + args[1:-1] +(k,))
+            if rhs_pack:
+                rval = reshaped_rhs[(fid + k) // feat_len_per_partition, \
+                            rhs_idx(eid), (fid + k) % feat_len_per_partition]
+            else:
+                rval = rhs.__getitem__((rhs_idx(args[0]),) + args[1:-1] +(k,))
+            return te.sum(lval * rval, axis=k)
         out = te.compute(out_shp, dot_edge_func, name='out')
     else:
-        def edge_func(*indice):
-            eid = indice[0]
-            fid = topi.util.ravel_index(indice[1:], out_shp[1:])
-            return binary_op_map[binary_op](
-                reshaped_lhs[fid // feat_len_per_partition, \
-                             lhs_idx(eid), fid % feat_len_per_partition], \
-                reshaped_rhs[fid // feat_len_per_partition, \
+        def edge_func(*args):
+            eid = args[0]
+            fid = topi.util.ravel_index(args[1:], out_shp[1:])
+            if lhs_pack:
+                lval = reshaped_lhs[fid // feat_len_per_partition, \
+                             lhs_idx(eid), fid % feat_len_per_partition]
+            else:
+                lval = lhs.__getitem__((lhs_idx(args[0]),) + args[1:])
+            if rhs_pack:
+                rval = reshaped_rhs[fid // feat_len_per_partition, \
                              rhs_idx(eid), fid % feat_len_per_partition]
-            )
+            else:
+                rval = rhs.__getitem__((rhs_idx(args[0]),) + args[1:])
+            return binary_op_map[binary_op](lval, rval)
         out = te.compute(out_shp, edge_func, name='out')
-    return out, feat_len_per_partition, [reshaped_lhs, reshaped_rhs], [bcast_lhs, bcast_rhs, flatten_lhs, flatten_rhs]
+    return out, inlines, reshapes
 
 def _sddmm_cuda_general(s, out):
     out_len = topi.util.get_const_int(topi.util.prod(out.shape[1:]))
@@ -115,33 +99,42 @@ def _sddmm_cpu_general(s, out):
     edge_axis = out.op.axis[0]
     s[out].parallel(edge_axis)
     
-def _sddmm_cpu_feat_partition(s, out, op, reshaped, inline, reduce_size, feat_len_per_partition):
-    for t in inline:
+def _sddmm_cpu_feat_partition(s, out, op, inlines, reshapes, reduce_size, num_feat_partitions):
+    for t in inlines:
         s[t].compute_inline()
-    for t in reshaped:
-        edge_axis = t.op.axis[1]
-        s[t].parallel(edge_axis)
     edge_axis = out.op.axis[0]
     feat_axis = s[out].fuse(*out.op.axis[1:])
+    feat_len = topi.util.get_const_int(topi.util.prod(out.shape[1:])) * reduce_size
+    feat_len_per_partition = feat_len // num_feat_partitions
+    outermost = None
     if op != 'dot':
         fo, fi = s[out].split(feat_axis, factor=feat_len_per_partition)
         s[out].reorder(fo, edge_axis, fi)
+        outermost = fo
     else:
         reduce_axis = out.op.reduce_axis[0]
         if reduce_size == feat_len_per_partition:
             s[out].reorder(feat_axis, edge_axis, reduce_axis)
+            outermost = feat_len
         elif reduce_size < feat_len_per_partition:
             fo, fi = s[out].split(feat_axis, factor=feat_len_per_partition // reduce_size)
             s[out].reorder(fo, edge_axis, fi, reduce_axis)
+            outermost = fo
         else:
             ro, ri = s[out].split(reduce_axis, factor=feat_len_per_partition)
             s[out].reorder(ro, feat_axis, edge_axis, ri)
+            outermost = ro
+    for t in reshapes:
+        s[t].compute_at(s[out], outermost)
+        s[t].parallel(t.op.axis[1])
     s[out].parallel(edge_axis)
 
 def sddmm(binary_op, nnz, num_rows, num_cols, 
           lhs_shp, rhs_shp, out_shp, indice_type, feat_type,
-          lhs_target=0, rhs_target=2,
+          lhs_target=0, rhs_target=2, is_sorted=2, use_idx=False,
           target='llvm', num_feat_partitions=1):
+    if binary_op in ['copy_lhs', 'copy_rhs']:
+        raise NotImplementedError
     if '32' in indice_type:
         indice_type = 'int32'
     elif '64' in indice_type:
@@ -156,11 +149,14 @@ def sddmm(binary_op, nnz, num_rows, num_cols,
         feat_type = 'float64'
     else:
         raise NotImplementedError
+    # check if use generic shape
     generic_shape = nnz == 0 and num_rows == 0 and num_cols == 0
     if generic_shape:
         num_rows = te.var('num_rows', indice_type)
         num_cols = te.var('num_cols', indice_type)
         nnz = te.var('nnz', indice_type)
+    # check if use bcast
+    use_bcast = lhs_shp != rhs_shp
     # check should be done in infer_out_shape
     if binary_op == 'dot':
         reduce_size = lhs_shp[-1]
@@ -169,6 +165,7 @@ def sddmm(binary_op, nnz, num_rows, num_cols,
     # placeholder for sparse matrix
     adj_row_indices = te.placeholder((nnz,), indice_type, 'adj_row_indices')
     adj_col_indices = te.placeholder((nnz,), indice_type, 'adj_col_indices')
+    edge_mapping = te.placeholder((nnz,), indice_type, 'edge_mapping')
     # placeholder for dense features
     def switch_target(t, s, name):
         if t == 0:
@@ -180,8 +177,11 @@ def sddmm(binary_op, nnz, num_rows, num_cols,
     lhs = switch_target(lhs_target, lhs_shp, 'lhs')
     rhs = switch_target(rhs_target, rhs_shp, 'rhs')
     # idx wrapper for corresponding target
+    # if use_idx and use packing, edge_mapping can be done in packing phase to save memory
     def idx_target(t):
-        def foo(eid):
+        def foo(eid, pack=False):
+            if pack:
+                return edge_mapping[eid] if use_idx and t == 1 else eid
             if t == 0:
                 return adj_row_indices[eid]
             elif t == 1:
@@ -189,25 +189,16 @@ def sddmm(binary_op, nnz, num_rows, num_cols,
             elif t == 2:
                 return adj_col_indices[eid]
         return foo
+    # if feature partition, decide whether to apply array packing
+    # sorted = 0 means row-sorted, 1 means col-sorted, 2 means not sorted
+    lhs_pack = (num_feat_partitions > 1 and not use_bcast) and \
+               ((lhs_target == 0 and is_sorted == 0) or (lhs_target == 2 and is_sorted == 1) or lhs_target == 1)
+    rhs_pack = (num_feat_partitions > 1 and not use_bcast) and \
+               ((rhs_target == 0 and is_sorted == 0) or (rhs_target == 2 and is_sorted == 1) or rhs_target == 1)
     # compute
-    if num_feat_partitions == 1:
-        out = _sddmm_compute((nnz,) + out_shp, binary_op, lhs, rhs, \
-            idx_target(lhs_target), idx_target(rhs_target))
-    else:
-        out, feat_len_per_partition, reshaped, inline = _sddmm_compute_feat_partition((nnz,) + out_shp, binary_op, lhs, rhs, \
-            idx_target(lhs_target), idx_target(rhs_target), num_feat_partitions)
-    # prepare input
-    f_input = []
-    if lhs_target == 0 or rhs_target == 0:
-        f_input.append(adj_row_indices)
-    if lhs_target == 2 or rhs_target == 2:
-        f_input.append(adj_col_indices)
-    f_name = '_'.join(str(x) for x in [
-        'sddmm', binary_op, nnz, num_rows, num_cols,
-         lhs_target, rhs_target,
-         indice_type, feat_type
-         ])
-    f_input += [lhs, rhs, out]
+    out, inlines, reshapes = _sddmm_compute((nnz,) + out_shp, binary_op, lhs, rhs, \
+                                            idx_target(lhs_target), idx_target(rhs_target),
+                                            num_feat_partitions, lhs_pack, rhs_pack)
     # schedule
     s = te.create_schedule(out.op)
     if target == 'cuda':
@@ -221,31 +212,43 @@ def sddmm(binary_op, nnz, num_rows, num_cols,
         if num_feat_partitions == 1:
             _sddmm_cpu_general(s, out)
         else:
-            _sddmm_cpu_feat_partition(s, out, binary_op, reshaped, inline, reduce_size, feat_len_per_partition)
+            _sddmm_cpu_feat_partition(s, out, binary_op, inlines, reshapes, reduce_size, num_feat_partitions)
+    # prepare input
+    f_input = []
+    if lhs_target == 0 or rhs_target == 0:
+        f_input.append(adj_row_indices)
+    if lhs_target == 2 or rhs_target == 2:
+        f_input.append(adj_col_indices)
+    # use_idx should only be set when array packing is applied
+    # otherwise mapping should be done outside of tvm
+    if use_idx:
+        f_input.append(edge_mapping)
+    f_name = '_'.join(str(x) for x in [
+        'sddmm', binary_op, 
+         lhs_target, rhs_target,
+         indice_type, feat_type
+         ])
+    f_input += [lhs, rhs, out]
     # bind autobroadcast buffer
     lhs_buffer = tvm.tir.decl_buffer(lhs.shape, lhs.dtype, name='lhs_buf', buffer_type='auto_broadcast')
     rhs_buffer = tvm.tir.decl_buffer(rhs.shape, rhs.dtype, name='rhs_buf', buffer_type='auto_broadcast')
-    # print(tvm.lower(s, f_input, binds={lhs:lhs_buffer, rhs:rhs_buffer}))
-    return tvm.build(s, f_input, target=target, name=f_name, binds={lhs:lhs_buffer, rhs:rhs_buffer})
+    binds = {}
+    if use_bcast:
+        binds = {lhs:lhs_buffer, rhs:rhs_buffer}
+    print(tvm.lower(s, f_input, binds=binds))
+    return tvm.build(s, f_input, target=target, name=f_name, binds=binds)
 
 if __name__ == '__main__':
-    print('hello')
-    import numpy as np
-    import dgl
-    import dgl.backend as F
     target = 'llvm'
-    lhs_shp = (1024,)
-    rhs_shp = (1024,)
-    out_shp = (1024,)
-    nnz = 3000
-    num_rows = 100
-    num_cols = 100
-    g = dgl.rand_graph(num_rows, nnz).astype(F.int32)
-    gidx = g._graph
-    row, col, _ = map(lambda x: tvm.nd.from_dlpack(x.to_dlpack()), gidx.get_coo_dlpack(0))
+    lhs_shp, rhs_shp = (8,), (8,)
+    out_shp = (1,)
+    nnz = 5
+    num_rows = 10
+    num_cols = 10
     indice_type = 'int32'
     feat_type = 'float32'
-    op = 'add'
-    f1 = sddmm(op, nnz, num_rows, num_cols, lhs_shp, rhs_shp, out_shp, indice_type, feat_type,\
-                lhs_target=0, rhs_target=2, target='cuda', num_feat_partitions=1)
-    # print(f1.imported_modules[0].get_source())
+    f = sddmm('dot', nnz, num_rows, num_cols, 
+         lhs_shp, rhs_shp, out_shp,
+         indice_type, feat_type, use_idx=False,
+         num_feat_partitions=2, target=target)
+    # print(f.imported_modules[0].get_source())

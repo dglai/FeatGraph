@@ -58,29 +58,27 @@ def _spmm(out_shp, binary_op, reduce_op, adj_indptr, adj_indices,
     inlines, reshapes = [], []
     if pack:
         # apply array packing on efeat because it can be continuous
-        num_cols = ufeat.shape[0]
         nnz = efeat.shape[0]
         feat_len = topi.util.get_const_int(topi.util.prod(efeat.shape[1:]))
-        flatten_ufeat = topi.reshape(ufeat, (num_cols, feat_len))
+        # flatten_ufeat = topi.reshape(ufeat, (num_cols, feat_len))
         flatten_efeat = topi.reshape(efeat, (nnz, feat_len))
         feat_len_per_partition = feat_len // num_feat_partitions
         reshaped_efeat = te.compute((num_feat_partitions, nnz, feat_len_per_partition), \
                                 lambda fo, idx, fi: flatten_efeat[edge_id(idx), fo * feat_len_per_partition + fi],
                                 name='reshaped_efeat')
-        inlines += [flatten_ufeat, flatten_efeat]
+        inlines.append(flatten_efeat)
         reshapes.append(reshaped_efeat)
     def msgfunc(*args):
         row = args[0]
         row_start = adj_indptr[row]
         row_end = adj_indptr[row + 1]
         elem_idx = te.reduce_axis((0, row_end-row_start), name="elem_idx")
+        u_val = ufeat.__getitem__((adj_indices[row_start + elem_idx],) + args[1:])
         if pack:
             fid = topi.util.ravel_index(args[1:], out_shp[1:])
-            u_val = flatten_ufeat[adj_indices[row_start + elem_idx], fid]
             e_val = reshaped_efeat[fid // feat_len_per_partition, row_start + elem_idx, \
                                     fid % feat_len_per_partition]
         else:
-            u_val = ufeat.__getitem__((adj_indices[row_start + elem_idx],) + args[1:])
             e_val = efeat.__getitem__((edge_id(row_start + elem_idx),) + args[1:])
         if reduce_op == 'sum':
             return te.sum(binary_op_map[binary_op](u_val, e_val), axis=elem_idx)
@@ -102,17 +100,16 @@ def _spmm_dds(out_shp, binary_op, reduce_op, adj_indptr, adj_indices,
     num_col_partitions = adj_indptr.shape[0]
     inlines, reshapes = [], []
     if pack:
-        num_cols = ufeat.shape[0]
+        #same as above
         nnz = efeat.shape[0]
         feat_len = topi.util.get_const_int(topi.util.prod(ufeat.shape[1:]))
         # assume divide num_feat_partitions
         feat_len_per_partition = feat_len // num_feat_partitions
-        flatten_ufeat = topi.reshape(ufeat, (num_cols, feat_len))
         flatten_efeat = topi.reshape(efeat, (nnz, feat_len))
         reshaped_efeat = te.compute((num_feat_partitions, nnz, feat_len_per_partition), \
                                 lambda fo, idx, fi: flatten_efeat[edge_id(idx), fo * feat_len_per_partition + fi],
                                 name='reshaped_efeat')
-        inlines += [flatten_ufeat, flatten_efeat]
+        inlines.append(flatten_efeat)
         reshapes.append(reshaped_efeat)
     def msgfunc(*args):
         col_part_idx = args[0]
@@ -120,12 +117,11 @@ def _spmm_dds(out_shp, binary_op, reduce_op, adj_indptr, adj_indices,
         row_start = adj_indptr[col_part_idx, row]
         row_end = adj_indptr[col_part_idx, row + 1]
         elem_idx = te.reduce_axis((0, row_end-row_start), name="elem_idx")
+        u_val = ufeat.__getitem__((adj_indices[row_start + elem_idx],) + args[2:])
         if pack:
             fid = topi.util.ravel_index(args[2:], out_shp[1:])
-            u_val = flatten_ufeat[adj_indices[row_start + elem_idx], fid]
             e_val = reshaped_efeat[fid // feat_len_per_partition, row_start + elem_idx, fid % feat_len_per_partition]
         else:
-            u_val = ufeat.__getitem__((adj_indices[row_start + elem_idx],) + args[2:])
             e_val = efeat.__getitem__((edge_id(row_start + elem_idx),) + args[2:])
         if reduce_op == 'sum':
             return te.sum(binary_op_map[binary_op](u_val, e_val), axis=elem_idx)
@@ -219,8 +215,6 @@ def _spmm_dds_sched(s, out, I, num_feat_partitions, inlines, reshapes):
     s[I].parallel(I.op.axis[1])
     # s[I].vectorize(I.op.axis[2])
     s[out].parallel(out.op.axis[0])
-
-    
 
 def spmm(binary_op, reduce_op, nnz, num_rows, num_cols, 
          lhs_shp, rhs_shp, out_shp,
@@ -333,5 +327,5 @@ if __name__ == '__main__':
     f = spmm('mul', 'sum', nnz, num_rows, num_cols, 
          lhs_shp, rhs_shp, out_shp,
          indice_type, feat_type, use_idx=True,
-         num_col_partitions=2, num_feat_partitions=2, target='llvm')
+         num_col_partitions=2, num_feat_partitions=2, target=target)
     # print(f.imported_modules[0].get_source())
